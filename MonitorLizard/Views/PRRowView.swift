@@ -35,12 +35,28 @@ extension NonBlockingCheckState {
     }
 }
 
+extension PRStackReadiness {
+    var color: Color {
+        switch status {
+        case .allReady, .readyToAdvance: return .green
+        case .blocked:                   return .orange
+        case .unknown:                   return .secondary
+        }
+    }
+}
+
 struct PRRowView: View {
-    let pr: PullRequest
+    let item: PRListItem
     @EnvironmentObject var viewModel: PRMonitorViewModel
     @Environment(\.scrollViewHovered) private var scrollViewHovered
 
     @State private var isHovering = false
+
+    private var pr: PullRequest { item.pr }
+
+    private var leadingPadding: CGFloat {
+        12 + CGFloat(item.indentLevel) * 14
+    }
 
     nonisolated static func daysSinceUpdate(from date: Date, now: Date = Date(), calendar: Calendar = .current) -> Int {
         let today = calendar.startOfDay(for: now)
@@ -74,6 +90,19 @@ struct PRRowView: View {
         } else {
             return "updated \(daysSinceUpdate) days ago"
         }
+    }
+
+    private func stackHelpText(_ stack: PRStackInfo) -> String {
+        guard let readinessText = item.stackReadiness?.helpText else { return stack.helpText }
+        return "\(stack.helpText) \(readinessText)"
+    }
+
+    private var watchHelpText: String {
+        let memberCount = viewModel.stackMemberCount(for: pr)
+        if pr.isWatched {
+            return memberCount > 1 ? "Stop watching this stack (\(memberCount) PRs)" : "Stop watching this PR"
+        }
+        return memberCount > 1 ? "Watch this stack (\(memberCount) PRs)" : "Watch this PR for completion"
     }
 
     private var failingChecks: [StatusCheck] {
@@ -216,6 +245,44 @@ struct PRRowView: View {
                             .background(Color.orange.opacity(0.8))
                             .cornerRadius(3)
                     }
+
+                    // Stack position badge
+                    if let stack = pr.stack {
+                        let tint = item.stackReadiness?.color ?? .secondary
+                        HStack(spacing: 3) {
+                            Image(systemName: "square.stack.3d.up")
+                                .font(.system(size: 9))
+                            Text(stack.positionLabel)
+                                .font(.caption2)
+                                .fontWeight(.medium)
+                        }
+                        .foregroundColor(tint)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(tint.opacity(0.15))
+                        .cornerRadius(3)
+                        .help(stackHelpText(stack))
+                        .accessibilityLabel("Stack part \(stack.position) of \(stack.size)")
+
+                        // Marks the part every later part is waiting on
+                        if case .blocked(let blocker) = item.stackReadiness?.status,
+                           blocker.number == pr.number {
+                            HStack(spacing: 3) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 9))
+                                Text("blocking")
+                                    .font(.caption2)
+                                    .fontWeight(.medium)
+                            }
+                            .foregroundColor(.orange)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.orange.opacity(0.15))
+                            .cornerRadius(3)
+                            .help("Blocks the rest of stack #\(stack.number) from advancing (\(blocker.reason)).")
+                            .accessibilityLabel("Blocking the stack: \(blocker.reason)")
+                        }
+                    }
                 }
 
                 // Branch name
@@ -323,7 +390,7 @@ struct PRRowView: View {
                                     .foregroundColor(pr.isWatched ? .blue : .gray)
                             }
                             .buttonStyle(.plain)
-                            .help(pr.isWatched ? "Stop watching this PR" : "Watch this PR for completion")
+                            .help(watchHelpText)
                             .opacity(isHovering || pr.isWatched ? 1.0 : 0.0)
                             .frame(width: 16, height: 16)
                         } else {
@@ -416,7 +483,8 @@ struct PRRowView: View {
             }
             .frame(width: 64, alignment: .trailing) // Fixed width: fits 3-icon row (Other PRs)
         }
-        .padding(.horizontal, 12)
+        .padding(.leading, leadingPadding)
+        .padding(.trailing, 12)
         .padding(.vertical, 10)
         .background(isHovering ? Color.gray.opacity(0.1) : Color.clear)
         .contentShape(Rectangle())

@@ -42,6 +42,43 @@ struct GitHubServiceBatchResponseParsingTests {
         #expect(result[request]?.reviewDecision == "APPROVED")
     }
 
+    @Test func parseBatchResponseExtractsStackEntry() throws {
+        let json = """
+        {
+          "data": {
+            "pr0": {
+              "pullRequest": {
+                "headRefName": "feature/stacked",
+                "statusCheckRollup": null,
+                "mergeable": null,
+                "mergeStateStatus": null,
+                "reviewDecision": null,
+                "latestReviews": { "nodes": [] },
+                "reviewRequests": { "nodes": [] },
+                "stackEntry": {
+                  "position": 2,
+                  "stack": { "id": "ST_stack", "number": 7, "size": 4 }
+                }
+              }
+            }
+          }
+        }
+        """
+        let request = PRStatusRequest(owner: "alice", repo: "repo", number: 2)
+
+        let result = try GitHubService.parseBatchResponse(json, requests: [request])
+
+        #expect(result[request]?.stack == PRStackInfo(id: "ST_stack", number: 7, size: 4, position: 2))
+    }
+
+    @Test func parseBatchResponseLeavesStackNilWhenPRIsNotStacked() throws {
+        let request = PRStatusRequest(owner: "alice", repo: "widgets", number: 42)
+
+        let result = try GitHubService.parseBatchResponse(Self.makeResponse(), requests: [request])
+
+        #expect(result[request]?.stack == nil)
+    }
+
     @Test func parseBatchResponseHandlesNullPullRequest() throws {
         let json = """
         { "data": { "pr0": { "pullRequest": null } } }

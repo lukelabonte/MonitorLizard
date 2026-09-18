@@ -64,6 +64,7 @@ struct PullRequest: Identifiable, Hashable, Codable {
     var reviewDecision: ReviewDecision?
     let host: String  // GitHub host (e.g. "github.com" or enterprise hostname)
     var customName: String?  // nil = use GitHub title
+    var stack: PRStackInfo?  // nil = not part of a GitHub stack
 
     var displayTitle: String { customName ?? title }
 
@@ -73,6 +74,30 @@ struct PullRequest: Identifiable, Hashable, Codable {
 
     var hasStatusChecks: Bool {
         !statusChecks.isEmpty
+    }
+
+    /// True when something known prevents the PR from being merged: failing or
+    /// pending checks, a conflict, no recent activity, or changes requested.
+    /// Used both to surface PRs that need attention and to find what a stack waits on.
+    var isMergeBlocked: Bool {
+        mergeBlockReason != nil
+    }
+
+    /// Short description of what prevents this PR from merging, or nil when nothing
+    /// known blocks it.
+    var mergeBlockReason: String? {
+        if reviewDecision == .changesRequested {
+            return "changes requested"
+        }
+        switch buildStatus {
+        case .failure:    return "failing checks"
+        case .error:      return "check errors"
+        case .conflict:   return "merge conflict"
+        case .notStarted: return "checks not started"
+        case .pending:    return "checks pending"
+        case .inactive:   return "inactive"
+        case .success, .unknown: return nil
+        }
     }
 
     struct RepositoryInfo: Hashable, Codable {
@@ -232,6 +257,7 @@ struct BatchPRStatusResponse: Codable {
     let latestReviews: ReviewConnection?
     let reviewRequests: ReviewRequestConnection?
     let baseRef: BaseRef?
+    let stackEntry: StackEntry?
 
     /// Wraps the raw GraphQL `statusCheckRollup { contexts { nodes [...] } }` shape.
     struct StatusCheckRollupWrapper: Codable {
@@ -277,6 +303,27 @@ struct BatchPRStatusResponse: Codable {
         let branchProtectionRule: BranchProtectionRule?
     }
 
+    struct StackEntry: Codable {
+        let position: Int?
+        let stack: Stack?
+
+        struct Stack: Codable {
+            let id: String
+            let number: Int
+            let size: Int
+        }
+
+        var stackInfo: PRStackInfo? {
+            guard let stack, let position else { return nil }
+            return PRStackInfo(
+                id: stack.id,
+                number: stack.number,
+                size: stack.size,
+                position: position
+            )
+        }
+    }
+
     struct BranchProtectionRule: Codable {
         let requiredStatusCheckContexts: [String]?
         let requiredStatusChecks: [RequiredStatusCheck]?
@@ -307,7 +354,8 @@ struct BatchPRStatusResponse: Codable {
             reviewDecision: reviewDecision,
             latestReviews: latestReviews?.nodes,
             reviewRequests: flatRequests,
-            requiredStatusCheckContexts: requiredStatusCheckContexts
+            requiredStatusCheckContexts: requiredStatusCheckContexts,
+            stack: stackEntry?.stackInfo
         )
     }
 }
@@ -332,6 +380,7 @@ struct GHPRDetailResponse: Codable {
     let latestReviews: [Review]?
     let reviewRequests: [ReviewRequest]?
     let requiredStatusCheckContexts: [String]?
+    let stack: PRStackInfo?
 
     init(
         headRefName: String,
@@ -342,7 +391,8 @@ struct GHPRDetailResponse: Codable {
         reviewDecision: String?,
         latestReviews: [Review]?,
         reviewRequests: [ReviewRequest]?,
-        requiredStatusCheckContexts: [String]? = nil
+        requiredStatusCheckContexts: [String]? = nil,
+        stack: PRStackInfo? = nil
     ) {
         self.headRefName = headRefName
         self.statusCheckRollup = statusCheckRollup
@@ -353,6 +403,7 @@ struct GHPRDetailResponse: Codable {
         self.latestReviews = latestReviews
         self.reviewRequests = reviewRequests
         self.requiredStatusCheckContexts = requiredStatusCheckContexts
+        self.stack = stack
     }
 
     struct Review: Codable {

@@ -114,7 +114,8 @@ enum DemoData {
                 StatusCheck(id: "3", name: "Security Scan", status: .success, detailsUrl: "https://github.com/example/check/3")
             ],
             reviewDecision: nil,
-            host: "github.com"
+            host: "github.com",
+            stack: PRStackInfo(id: "demo-stack-camembert", number: 12, size: 2, position: 1)
         ),
 
         // 5. PENDING - Authored PR
@@ -165,7 +166,8 @@ enum DemoData {
                 StatusCheck(id: "1", name: "Merge Conflict Check", status: .failure, detailsUrl: "https://github.com/example/check/1")
             ],
             reviewDecision: nil,
-            host: "github.com"
+            host: "github.com",
+            stack: PRStackInfo(id: "demo-stack-camembert", number: 12, size: 2, position: 2)
         ),
 
         // 7. INACTIVE - Authored PR (Draft)

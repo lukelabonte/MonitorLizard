@@ -207,10 +207,10 @@ struct MenuBarView: View {
                         sectionHeader(type: .reviewing, count: viewModel.reviewPRs.count)
                             .id("header-review")
 
-                        ForEach(viewModel.reviewPRs) { pr in
-                            PRRowView(pr: pr)
+                        ForEach(viewModel.sectionItems(for: .reviewing)) { item in
+                            PRRowView(item: item)
                                 .environmentObject(viewModel)
-                                .id("review-\(pr.id)")
+                                .id("review-\(item.id)")
                             Divider()
                         }
                     }
@@ -220,10 +220,10 @@ struct MenuBarView: View {
                         sectionHeader(type: .other, count: viewModel.filteredOtherPRs.count)
                             .id("header-other")
 
-                        ForEach(viewModel.filteredOtherPRs) { pr in
-                            PRRowView(pr: pr)
+                        ForEach(viewModel.sectionItems(for: .other)) { item in
+                            PRRowView(item: item)
                                 .environmentObject(viewModel)
-                                .id("other-\(pr.id)")
+                                .id("other-\(item.id)")
                             Divider()
                         }
                     }
@@ -233,10 +233,10 @@ struct MenuBarView: View {
                         sectionHeader(type: .authored, count: viewModel.authoredPRs.count)
                             .id("header-authored")
 
-                        ForEach(viewModel.authoredPRs) { pr in
-                            PRRowView(pr: pr)
+                        ForEach(viewModel.sectionItems(for: .authored)) { item in
+                            PRRowView(item: item)
                                 .environmentObject(viewModel)
-                                .id("authored-\(pr.id)")
+                                .id("authored-\(item.id)")
                             Divider()
                         }
                     }

@@ -34,6 +34,10 @@ struct GitHubServiceFetchOtherPRTests {
             "reviewDecision": "APPROVED",
             "latestReviews": { "nodes": [] },
             "reviewRequests": { "nodes": [] },
+            "stackEntry": {
+              "position": 1,
+              "stack": { "id": "ST_stack", "number": 7, "size": 2 }
+            },
             "baseRef": {
               "branchProtectionRule": {
                 "requiredStatusCheckContexts": ["required_ci"],
@@ -103,6 +107,7 @@ struct GitHubServiceFetchOtherPRTests {
         #expect(pr.number == 42)
         #expect(pr.title == "Track required checks")
         #expect(pr.headRefName == "feature/required-checks")
+        #expect(pr.stack == PRStackInfo(id: "ST_stack", number: 7, size: 2, position: 1))
         #expect(pr.buildStatus == .success)
         #expect(pr.statusChecks.map(\.name) == ["required_ci"])
         #expect(calls.filter { $0.arguments.contains("graphql") }.count == 1)

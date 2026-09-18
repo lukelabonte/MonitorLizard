@@ -57,6 +57,10 @@ class GitHubService: GitHubServicing, ObservableObject {
     // Cache for the session to avoid a redundant `gh auth status` call every 30 s.
     private var cachedHosts: [String]?
 
+    // Hosts whose GraphQL schema predates stack support, detected when the first
+    // stack-aware query fails. Kept for the session like `cachedHosts`.
+    private var hostsWithoutStackInfo: Set<String> = []
+
     init() {}
 
     func checkGHAvailable() async throws {
@@ -97,11 +101,31 @@ class GitHubService: GitHubServicing, ObservableObject {
 
     // MARK: - Batch GraphQL
 
+    /// Placeholder for the stack selection inside the query templates. It is
+    /// replaced with `stackEntrySelection` when the host supports stacks, and with
+    /// an empty string for hosts whose schema predates stack support.
+    nonisolated private static let stackEntryPlaceholder = "__ML_STACK_ENTRY__"
+
+    nonisolated private static let stackEntrySelection = """
+    stackEntry {
+      position
+      stack {
+        id
+        number
+        size
+      }
+    }
+    """
+
     /// Builds a single `gh api graphql` query that fetches status for all given PRs.
     /// Each PR gets an alias `pr<index>` so the response can be mapped back by position.
-    nonisolated static func buildBatchQuery(for requests: [PRStatusRequest]) -> String {
+    ///
+    /// - Parameter includeStackInfo: Pass false for hosts whose schema has no stack
+    ///   fields (`PullRequest.stackEntry`); the query is otherwise identical.
+    nonisolated static func buildBatchQuery(for requests: [PRStatusRequest], includeStackInfo: Bool = true) -> String {
         guard !requests.isEmpty else { return "query {}" }
 
+        let stackEntry = includeStackInfo ? stackEntrySelection : ""
         let fragments = requests.enumerated().map { index, req in
             """
             pr\(index): repository(owner: "\(req.owner)", name: "\(req.repo)") {
@@ -153,16 +177,18 @@ class GitHubService: GitHubServicing, ObservableObject {
                     }
                   }
                 }
+                \(stackEntryPlaceholder)
               }
             }
-            """
+            """.replacingOccurrences(of: stackEntryPlaceholder, with: stackEntry)
         }
 
         return "query {\n\(fragments.joined(separator: "\n"))}"
     }
 
-    nonisolated static func buildPRDetailQuery(for request: PRStatusRequest) -> String {
-        """
+    nonisolated static func buildPRDetailQuery(for request: PRStatusRequest, includeStackInfo: Bool = true) -> String {
+        let stackEntry = includeStackInfo ? stackEntrySelection : ""
+        return """
         query {
           pr0: repository(owner: "\(request.owner)", name: "\(request.repo)") {
             pullRequest(number: \(request.number)) {
@@ -227,10 +253,11 @@ class GitHubService: GitHubServicing, ObservableObject {
                   }
                 }
               }
+              \(stackEntryPlaceholder)
             }
           }
         }
-        """
+        """.replacingOccurrences(of: stackEntryPlaceholder, with: stackEntry)
     }
 
     /// Parses a `gh api graphql` batch response and maps the per-alias results back to
@@ -269,17 +296,49 @@ class GitHubService: GitHubServicing, ObservableObject {
             .map { Array(requests[$0..<min($0 + Constants.batchQueryChunkSize, requests.count)]) }
 
         for chunk in chunks {
-            let query = GitHubService.buildBatchQuery(for: chunk)
-            let json = try await shellExecutor.execute(
-                command: "gh",
-                arguments: ["api", "graphql", "-f", "query=\(query)"],
-                host: host
-            )
+            let json = try await executeGraphQL(host: host) { includeStackInfo in
+                GitHubService.buildBatchQuery(for: chunk, includeStackInfo: includeStackInfo)
+            }
             let chunkResult = try GitHubService.parseBatchResponse(json, requests: chunk)
             result.merge(chunkResult) { _, new in new }
         }
 
         return result
+    }
+
+    /// Runs a GraphQL query, retrying once per host without stack metadata when the
+    /// host's schema predates stack support.
+    private func executeGraphQL(
+        host: String,
+        buildQuery: (Bool) -> String
+    ) async throws -> String {
+        let includeStackInfo = !hostsWithoutStackInfo.contains(host)
+        do {
+            return try await shellExecutor.execute(
+                command: "gh",
+                arguments: ["api", "graphql", "-f", "query=\(buildQuery(includeStackInfo))"],
+                host: host
+            )
+        } catch let error as ShellError
+            where includeStackInfo && GitHubService.isStackInfoUnsupportedError(error) {
+            hostsWithoutStackInfo.insert(host)
+            return try await shellExecutor.execute(
+                command: "gh",
+                arguments: ["api", "graphql", "-f", "query=\(buildQuery(false))"],
+                host: host
+            )
+        }
+    }
+
+    /// True when a query failed because the host's schema has no stack fields, which
+    /// older GitHub Enterprise versions report as an unknown `stackEntry` field.
+    nonisolated static func isStackInfoUnsupportedError(_ error: Error) -> Bool {
+        guard case ShellError.executionFailed(let message) = error else { return false }
+        let lowered = message.lowercased()
+        guard lowered.contains("stackentry") else { return false }
+        return lowered.contains("doesn't exist")
+            || lowered.contains("does not exist")
+            || lowered.contains("unknown field")
     }
 
     // MARK: - Fetch
@@ -487,7 +546,8 @@ class GitHubService: GitHubServicing, ObservableObject {
                     latestReviews: detail?.latestReviews,
                     reviewRequests: detail?.reviewRequests
                 ),
-                host: host
+                host: host,
+                stack: detail?.stack
             )
         }
     }
@@ -1025,7 +1085,8 @@ class GitHubService: GitHubServicing, ObservableObject {
                 isDraft: isDraft,
                 statusChecks: statusChecks,
                 reviewDecision: reviewDecision,
-                host: host
+                host: host,
+                stack: response.stackEntry?.stackInfo
             )
         } catch {
             throw error
@@ -1033,12 +1094,9 @@ class GitHubService: GitHubServicing, ObservableObject {
     }
 
     private func fetchPRDetail(for request: PRStatusRequest, host: String) async throws -> BatchPRStatusResponse? {
-        let query = GitHubService.buildPRDetailQuery(for: request)
-        let json = try await shellExecutor.execute(
-            command: "gh",
-            arguments: ["api", "graphql", "-f", "query=\(query)"],
-            host: host
-        )
+        let json = try await executeGraphQL(host: host) { includeStackInfo in
+            GitHubService.buildPRDetailQuery(for: request, includeStackInfo: includeStackInfo)
+        }
 
         guard let data = json.data(using: .utf8) else {
             throw GitHubError.invalidResponse

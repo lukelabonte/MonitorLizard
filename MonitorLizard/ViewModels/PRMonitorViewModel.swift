@@ -47,6 +47,7 @@ class PRMonitorViewModel: ObservableObject {
     private var defaultsObserver: AnyCancellable?
     private var unsortedPullRequests: [PullRequest] = []
     private var copiedPRLinkTask: Task<Void, Never>?
+    private var readyStackIDs: Set<String> = []
 
     var copyClearTask: Task<Void, Never>? { copiedPRLinkTask }
 
@@ -107,23 +108,40 @@ class PRMonitorViewModel: ObservableObject {
         })
     }
 
+    /// PRs for a section in display order, with members of the same stack kept
+    /// adjacent in GitHub's stack-popover order (base at the bottom).
+    func sectionItems(for type: PRType) -> [PRListItem] {
+        PRStackOrdering.items(from: visiblePRs(for: type))
+    }
+
     var authoredPRs: [PullRequest] {
-        let prs = pullRequests.filter { $0.type == .authored }
-            .filter { selectedRepository == "All Repositories" || $0.repository.nameWithOwner == selectedRepository }
-        return hideInactivePRs ? prs.filter { !isInactiveByAge($0) } : prs
+        sectionItems(for: .authored).map(\.pr)
     }
 
     var reviewPRs: [PullRequest] {
-        guard showReviewPRs else { return [] }
-        let prs = pullRequests.filter { $0.type == .reviewing }
-            .filter { selectedRepository == "All Repositories" || $0.repository.nameWithOwner == selectedRepository }
-        return prs
+        sectionItems(for: .reviewing).map(\.pr)
     }
 
     var filteredOtherPRs: [PullRequest] {
-        let prs = otherPullRequests
-            .filter { selectedRepository == "All Repositories" || $0.repository.nameWithOwner == selectedRepository }
-        return hideInactivePRs ? prs.filter { !isInactiveByAge($0) } : prs
+        sectionItems(for: .other).map(\.pr)
+    }
+
+    private func visiblePRs(for type: PRType) -> [PullRequest] {
+        switch type {
+        case .reviewing:
+            guard showReviewPRs else { return [] }
+            return pullRequests.filter { $0.type == .reviewing && matchesSelectedRepository($0) }
+        case .authored:
+            let prs = pullRequests.filter { $0.type == .authored && matchesSelectedRepository($0) }
+            return hideInactivePRs ? prs.filter { !isInactiveByAge($0) } : prs
+        case .other:
+            let prs = otherPullRequests.filter(matchesSelectedRepository)
+            return hideInactivePRs ? prs.filter { !isInactiveByAge($0) } : prs
+        }
+    }
+
+    private func matchesSelectedRepository(_ pr: PullRequest) -> Bool {
+        selectedRepository == "All Repositories" || pr.repository.nameWithOwner == selectedRepository
     }
 
     private func isInactiveByAge(_ pr: PullRequest) -> Bool {
@@ -242,6 +260,7 @@ class PRMonitorViewModel: ObservableObject {
             customNamesService.pruneStale(keeping: activeIDs)
 
             applySorting()
+            notifyReadyStacks(allPRs: dedupedPRs + fetchedOther)
 
             if !fetchResult.isPartial &&
                 selectedRepository != "All Repositories" &&
@@ -425,33 +444,73 @@ class PRMonitorViewModel: ObservableObject {
 
     private func sort(_ prs: [PullRequest]) -> [PullRequest] {
         prs.sorted { pr1, pr2 in
-            let nonSuccessStatuses: [BuildStatus] = [.failure, .error, .conflict, .notStarted, .pending, .inactive]
-            let pr1NonSuccess = nonSuccessStatuses.contains(pr1.buildStatus) || pr1.reviewDecision == .changesRequested
-            let pr2NonSuccess = nonSuccessStatuses.contains(pr2.buildStatus) || pr2.reviewDecision == .changesRequested
-
-            if pr1NonSuccess != pr2NonSuccess {
-                return pr1NonSuccess
+            if pr1.isMergeBlocked != pr2.isMergeBlocked {
+                return pr1.isMergeBlocked
             }
 
             return false
         }
     }
 
-    func toggleWatch(for pr: PullRequest) {
-        if watchlistService.isWatched(pr) {
-            watchlistService.unwatch(pr)
-        } else {
-            watchlistService.watch(pr)
-        }
+    /// Number of stack parts the app knows about for the given PR; 1 when the PR is
+    /// not stacked, so a stack is watched as a unit.
+    func stackMemberCount(for pr: PullRequest) -> Int {
+        stackMembers(of: pr).count
+    }
 
-        if let index = unsortedPullRequests.firstIndex(where: { $0.id == pr.id }) {
-            unsortedPullRequests[index].isWatched.toggle()
+    func toggleWatch(for pr: PullRequest) {
+        let members = stackMembers(of: pr)
+        let shouldWatch = !watchlistService.isWatched(pr)
+
+        for member in members {
+            if shouldWatch {
+                watchlistService.watch(member)
+            } else {
+                watchlistService.unwatch(member)
+            }
+            setWatched(member.id, shouldWatch)
         }
-        if let index = pullRequests.firstIndex(where: { $0.id == pr.id }) {
-            pullRequests[index].isWatched.toggle()
+    }
+
+    private func stackMembers(of pr: PullRequest) -> [PullRequest] {
+        guard let stackID = pr.stack?.id else { return [pr] }
+        let members = (unsortedPullRequests + otherPullRequests).filter { $0.stack?.id == stackID }
+        return members.isEmpty ? [pr] : members
+    }
+
+    private func setWatched(_ prID: String, _ isWatched: Bool) {
+        if let index = unsortedPullRequests.firstIndex(where: { $0.id == prID }) {
+            unsortedPullRequests[index].isWatched = isWatched
         }
-        if let index = otherPullRequests.firstIndex(where: { $0.id == pr.id }) {
-            otherPullRequests[index].isWatched.toggle()
+        if let index = pullRequests.firstIndex(where: { $0.id == prID }) {
+            pullRequests[index].isWatched = isWatched
+        }
+        if let index = otherPullRequests.firstIndex(where: { $0.id == prID }) {
+            otherPullRequests[index].isWatched = isWatched
+        }
+    }
+
+    /// Notifies once per watched stack when it is ready to merge. A stack that
+    /// becomes ready before anyone watches it stays pending, so watching it later
+    /// still produces the notification on the next refresh.
+    private func notifyReadyStacks(allPRs: [PullRequest]) {
+        let transition = PRStackOrdering.readinessTransitions(previouslyReady: readyStackIDs, prs: allPRs)
+        readyStackIDs = transition.readyStackIDs
+
+        for readyStack in transition.newlyReady {
+            let hasWatchedMember = allPRs.contains {
+                $0.stack?.id == readyStack.id && watchlistService.isWatched($0)
+            }
+            guard hasWatchedMember else {
+                readyStackIDs.remove(readyStack.id)
+                continue
+            }
+            notificationService.notifyStackReady(
+                stackID: readyStack.id,
+                stackNumber: readyStack.number,
+                size: readyStack.size,
+                allReady: readyStack.allReady
+            )
         }
     }
 

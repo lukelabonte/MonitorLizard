@@ -239,6 +239,10 @@ private struct UnimplementedNotificationService: NotificationServicing {
     func notifyBuildComplete(pr: PullRequest, status: BuildStatus) {
         reportIssue("Unimplemented: NotificationServicing.notifyBuildComplete called without a test override")
     }
+
+    func notifyStackReady(stackID: String, stackNumber: Int, size: Int, allReady: Bool) {
+        reportIssue("Unimplemented: NotificationServicing.notifyStackReady called without a test override")
+    }
 }
 
 private struct UnimplementedPRCacheService: PRCacheServicing {

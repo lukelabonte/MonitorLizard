@@ -62,9 +62,47 @@ struct GitHubServiceBatchQueryTests {
         #expect(query.range(of: #"statusCheckRollup\s*\{\s*state"#, options: .regularExpression) != nil)
     }
 
+    @Test(arguments: RequiredMetadataQueryScenario.allCases)
+    func queryIncludesStackMetadata(scenario: RequiredMetadataQueryScenario) {
+        let query = scenario.query
+
+        #expect(query.contains("stackEntry"))
+        #expect(query.range(of: #"stackEntry\s*\{\s*position"#, options: .regularExpression) != nil)
+        #expect(query.range(of: #"stack\s*\{\s*id\s+number\s+size\s*\}"#, options: .regularExpression) != nil)
+    }
+
+    @Test(arguments: RequiredMetadataQueryScenario.allCases)
+    func queryOmitsStackMetadataWhenHostSchemaDoesNotSupportIt(scenario: RequiredMetadataQueryScenario) {
+        let request = PRStatusRequest(owner: "alice", repo: "repo", number: 42)
+        let query = switch scenario {
+        case .batch:
+            GitHubService.buildBatchQuery(for: [request], includeStackInfo: false)
+        case .detail:
+            GitHubService.buildPRDetailQuery(for: request, includeStackInfo: false)
+        }
+
+        #expect(!query.contains("stackEntry"))
+        #expect(query.contains("pr0"))
+    }
+
     @Test func buildBatchQueryForEmptyListProducesValidQuery() {
         let query = GitHubService.buildBatchQuery(for: [])
         #expect(query.contains("query"))
+    }
+
+    @Test func detectsStackUnsupportedSchemaErrors() {
+        for message in [
+            "gh: Field 'stackEntry' doesn't exist on type 'PullRequest'",
+            "GraphQL: Field 'stackEntry' does not exist on type 'PullRequest'",
+            "Unknown field 'stackEntry'",
+        ] {
+            #expect(GitHubService.isStackInfoUnsupportedError(ShellError.executionFailed(message)))
+        }
+
+        #expect(!GitHubService.isStackInfoUnsupportedError(ShellError.executionFailed("error connecting to api.github.com")))
+        #expect(!GitHubService.isStackInfoUnsupportedError(ShellError.networkError("offline")))
+        #expect(!GitHubService.isStackInfoUnsupportedError(ShellError.invalidOutput))
+        #expect(!GitHubService.isStackInfoUnsupportedError(GitHubError.invalidResponse))
     }
 
     @Test func buildBatchQueryUsesIndexBasedAliases() {

@@ -7,6 +7,7 @@ import UserNotifications
 protocol NotificationServicing: Sendable {
     func requestAuthorization() async throws
     func notifyBuildComplete(pr: PullRequest, status: BuildStatus)
+    func notifyStackReady(stackID: String, stackNumber: Int, size: Int, allReady: Bool)
 }
 
 /// Posts system notifications, plays sounds, and speaks announcements for build completions.
@@ -55,6 +56,34 @@ final class NotificationService: NotificationServicing, @unchecked Sendable {
 
         if voiceEnabled && status == .success {
             speak(text: voiceAnnouncementText)
+        }
+    }
+
+    func notifyStackReady(stackID: String, stackNumber: Int, size: Int, allReady: Bool) {
+        if notificationsEnabled {
+            let content = UNMutableNotificationContent()
+            content.title = "✅ Stack ready"
+            content.subtitle = "Stack #\(stackNumber)"
+            content.body = allReady
+                ? "All \(size) pull requests in this stack are ready to merge."
+                : "Part 1 of \(size) is ready to merge."
+            content.sound = .default
+
+            let request = UNNotificationRequest(
+                identifier: "stack-\(stackID)",
+                content: content,
+                trigger: nil
+            )
+
+            UNUserNotificationCenter.current().add(request) { error in
+                if let error = error {
+                    print("Error showing notification: \(error.localizedDescription)")
+                }
+            }
+        }
+
+        if soundsEnabled {
+            playSound(for: .success)
         }
     }
 

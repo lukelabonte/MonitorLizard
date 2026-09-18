@@ -795,6 +795,48 @@ struct PRMonitorViewModelTests {
         }
     }
 
+    // MARK: - Stacked PRs
+
+    @Test
+    func sectionItemsGroupStackedPRsWithNewestPartOnTop() {
+        let vm = makeVM()
+
+        var basePR = makePR(number: 1, nameWithOwner: "acme/widget")
+        basePR.stack = PRStackInfo(id: "ST_stack", number: 3, size: 2, position: 1)
+        var topPR = makePR(number: 2, nameWithOwner: "acme/widget")
+        topPR.stack = PRStackInfo(id: "ST_stack", number: 3, size: 2, position: 2)
+
+        vm.otherPullRequests = [basePR, topPR]
+
+        let items = vm.sectionItems(for: .other)
+
+        #expect(items.map(\.pr.number) == [2, 1])
+        #expect(items.map(\.indentLevel) == [1, 0])
+        #expect(vm.filteredOtherPRs.map(\.number) == [2, 1])
+    }
+
+    @Test
+    func toggleWatchWatchesEveryKnownStackMember() {
+        let vm = makeVM()
+
+        var part1 = makePR(number: 1, nameWithOwner: "acme/widget")
+        part1.stack = PRStackInfo(id: "ST_stack", number: 3, size: 2, position: 1)
+        var part2 = makePR(number: 2, nameWithOwner: "acme/widget")
+        part2.stack = PRStackInfo(id: "ST_stack", number: 3, size: 2, position: 2)
+
+        vm.otherPullRequests = [part2, part1]
+        #expect(vm.stackMemberCount(for: part1) == 2)
+
+        vm.toggleWatch(for: part1)
+
+        #expect(vm.otherPullRequests.allSatisfy { $0.isWatched })
+        #expect(vm.stackMemberCount(for: part2) == 2)
+
+        vm.toggleWatch(for: vm.otherPullRequests[0])
+
+        #expect(vm.otherPullRequests.allSatisfy { !$0.isWatched })
+    }
+
     // MARK: - Hide Inactive PRs
 
     @Test
@@ -947,5 +989,127 @@ struct PRMonitorViewModelTests {
 
         let repos = vm.availableRepositories
         #expect(repos.count == 2, "Repo list should still include all repos even when inactive PRs are hidden")
+    }
+}
+
+@MainActor
+private final class StubGitHubService: GitHubServicing {
+    var result = PRFetchResult(pullRequests: [], isPartial: false)
+
+    func checkGHAvailable() async throws {}
+    func invalidateHostsCache() {}
+
+    func fetchAllOpenPRs(enableInactiveDetection: Bool, inactiveThresholdDays: Int, isDemoMode: Bool) async throws -> PRFetchResult {
+        result
+    }
+
+    func fetchPRStatus(owner: String, repo: String, number: Int, updatedAt: Date, enableInactiveDetection: Bool, inactiveThresholdDays: Int, host: String) async throws -> (status: BuildStatus, headRefName: String, statusChecks: [StatusCheck], reviewDecision: ReviewDecision?) {
+        (.success, "", [], nil)
+    }
+
+    func fetchOtherPR(_ id: OtherPRIdentifier, enableInactiveDetection: Bool, inactiveThresholdDays: Int) async throws -> PullRequest? {
+        nil
+    }
+}
+
+private final class StackReadySpy: NotificationServicing, @unchecked Sendable {
+    struct Notification: Equatable {
+        let number: Int
+        let size: Int
+        let allReady: Bool
+    }
+
+    private let lock = NSLock()
+    private var recorded: [Notification] = []
+
+    func requestAuthorization() async throws {}
+
+    func notifyBuildComplete(pr: PullRequest, status: BuildStatus) {}
+
+    func notifyStackReady(stackID: String, stackNumber: Int, size: Int, allReady: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        recorded.append(Notification(number: stackNumber, size: size, allReady: allReady))
+    }
+
+    var notifications: [Notification] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
+    }
+}
+
+@MainActor
+@Suite(.serialized)
+struct StackWatchNotificationTests {
+
+    private func makeStackedPR(_ number: Int, position: Int, status: BuildStatus) -> PullRequest {
+        PullRequest(
+            number: number,
+            title: "PR #\(number)",
+            repository: PullRequest.RepositoryInfo(name: "repo", nameWithOwner: "owner/repo"),
+            url: "https://github.com/owner/repo/pull/\(number)",
+            author: PullRequest.Author(login: "alice"),
+            headRefName: "feature/\(number)",
+            updatedAt: Date(),
+            buildStatus: status,
+            isWatched: false,
+            labels: [],
+            type: .authored,
+            isDraft: false,
+            statusChecks: [],
+            reviewDecision: nil,
+            host: "github.com",
+            stack: PRStackInfo(id: "ST_stack", number: 42, size: 2, position: position)
+        )
+    }
+
+    @Test
+    func notifiesOnceWhenAWatchedStackBecomesReady() async {
+        let stub = StubGitHubService()
+        let spy = StackReadySpy()
+        let vm = withDependencies {
+            $0.userDefaults = UserDefaultsStore.testSuite()
+            $0.watchlistService = WatchlistService()
+            $0.notificationService = spy
+            $0.otherPRsService = OtherPRsService()
+            $0.customNamesService = CustomNamesService()
+            $0.cacheService = PRCacheService()
+            $0[GitHubServiceKey.self] = stub
+        } operation: {
+            PRMonitorViewModel(isDemoMode: false)
+        }
+        vm.stopPolling()
+        // Let the poll started by init finish so only the refreshes below drive the spy.
+        for _ in 0..<40 {
+            if vm.lastRefreshTime != nil { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        stub.result = PRFetchResult(pullRequests: [
+            makeStackedPR(1, position: 1, status: .pending),
+            makeStackedPR(2, position: 2, status: .pending),
+        ], isPartial: false)
+        await vm.refresh()
+
+        stub.result = PRFetchResult(pullRequests: [
+            makeStackedPR(1, position: 1, status: .success),
+            makeStackedPR(2, position: 2, status: .success),
+        ], isPartial: false)
+        await vm.refresh()
+        #expect(spy.notifications.isEmpty, "An unwatched stack must not notify")
+
+        guard let pr = vm.authoredPRs.first else {
+            Issue.record("Expected authored stack PRs")
+            return
+        }
+        vm.toggleWatch(for: pr)
+        #expect(vm.authoredPRs.allSatisfy { $0.isWatched })
+
+        await vm.refresh()
+        #expect(spy.notifications == [.init(number: 42, size: 2, allReady: true)])
+
+        await vm.refresh()
+        #expect(spy.notifications.count == 1, "A ready stack must only notify once")
     }
 }

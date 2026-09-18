@@ -40,6 +40,28 @@ struct GitHubServiceBatchIntegrationTests {
     }
     """
 
+    private static let stackedStatusResult = """
+    {
+      "data": {
+        "pr0": {
+          "pullRequest": {
+            "headRefName": "feature/second",
+            "statusCheckRollup": null,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "reviewDecision": null,
+            "latestReviews": { "nodes": [] },
+            "reviewRequests": { "nodes": [] },
+            "stackEntry": {
+              "position": 2,
+              "stack": { "id": "ST_stack", "number": 12, "size": 3 }
+            }
+          }
+        }
+      }
+    }
+    """
+
     private static func rollupStateOnlyResult(state: String) -> String {
         """
         {
@@ -539,6 +561,82 @@ struct GitHubServiceBatchIntegrationTests {
         let result = try await service.fetchAllOpenPRs(enableInactiveDetection: false, inactiveThresholdDays: 3)
 
         #expect(result.pullRequests.first?.headRefName == "feature/test")
+    }
+
+    @Test func fetchAllOpenPRsMapsStackEntryOntoPullRequest() async throws {
+        let mock = MockShellExecutor(
+            executeResponseMatchers: [
+                ("--author=@me", .success(Self.authoredSearchResult)),
+                ("graphql", .success(Self.stackedStatusResult))
+            ]
+        )
+        let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }
+
+        let result = try await service.fetchAllOpenPRs(enableInactiveDetection: false, inactiveThresholdDays: 3)
+        let pr = try #require(result.pullRequests.first)
+
+        #expect(pr.stack == PRStackInfo(id: "ST_stack", number: 12, size: 3, position: 2))
+    }
+
+    /// Fails any query that selects stack metadata, the way an older GitHub
+    /// Enterprise schema does.
+    private static func stackUnsupportedMock() -> MockShellExecutor {
+        MockShellExecutor(
+            executeResponseMatchers: [
+                ("--author=@me", .success(Self.authoredSearchResult)),
+                ("stackEntry", .failure(ShellError.executionFailed(
+                    "gh: Field 'stackEntry' doesn't exist on type 'PullRequest'"
+                ))),
+                ("graphql", .success(Self.batchStatusResult)),
+            ]
+        )
+    }
+
+    @Test func fetchAllOpenPRsRetriesWithoutStackInfoWhenSchemaRejectsIt() async throws {
+        let mock = Self.stackUnsupportedMock()
+        let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }
+
+        let result = try await service.fetchAllOpenPRs(enableInactiveDetection: false, inactiveThresholdDays: 3)
+        let pr = try #require(result.pullRequests.first)
+        let calls = await mock.executeCalls
+        let queries = calls
+            .filter { $0.arguments.contains("graphql") }
+            .map { $0.arguments.joined(separator: " ") }
+
+        #expect(pr.buildStatus == .success)
+        #expect(pr.stack == nil)
+        #expect(queries.count == 2)
+        #expect(queries.contains { $0.contains("stackEntry") })
+        #expect(queries.contains { !$0.contains("stackEntry") })
+    }
+
+    @Test func fetchAllOpenPRsRemembersHostsWithoutStackInfo() async throws {
+        let mock = Self.stackUnsupportedMock()
+        let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }
+
+        _ = try await service.fetchAllOpenPRs(enableInactiveDetection: false, inactiveThresholdDays: 3)
+        _ = try await service.fetchAllOpenPRs(enableInactiveDetection: false, inactiveThresholdDays: 3)
+        let calls = await mock.executeCalls
+        let queries = calls
+            .filter { $0.arguments.contains("graphql") }
+            .map { $0.arguments.joined(separator: " ") }
+
+        #expect(queries.count == 3)
+        #expect(queries.filter { $0.contains("stackEntry") }.count == 1)
+    }
+
+    @Test func fetchAllOpenPRsLeavesStackNilWhenPRIsNotStacked() async throws {
+        let mock = MockShellExecutor(
+            executeResponseMatchers: [
+                ("--author=@me", .success(Self.authoredSearchResult)),
+                ("graphql", .success(Self.batchStatusResult))
+            ]
+        )
+        let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }
+
+        let result = try await service.fetchAllOpenPRs(enableInactiveDetection: false, inactiveThresholdDays: 3)
+
+        #expect(result.pullRequests.first?.stack == nil)
     }
 
     @Test(arguments: [
