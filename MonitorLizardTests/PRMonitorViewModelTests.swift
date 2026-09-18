@@ -1056,6 +1056,7 @@ private final class StubGitHubService: GitHubServicing {
     }
 
     var stackParts: [PullRequest] = []
+    var stackMergedPositions: [Int] = []
 
     func fetchMissingStackParts(
         stackID: String,
@@ -1066,8 +1067,11 @@ private final class StubGitHubService: GitHubServicing {
         type: PRType,
         enableInactiveDetection: Bool,
         inactiveThresholdDays: Int
-    ) async throws -> [PullRequest] {
-        stackParts.filter { !knownNumbers.contains($0.number) }
+    ) async throws -> StackCompletion {
+        StackCompletion(
+            missingParts: stackParts.filter { !knownNumbers.contains($0.number) },
+            mergedPositions: stackMergedPositions
+        )
     }
 }
 
@@ -1198,19 +1202,7 @@ struct StackCompletionTests {
         )
     }
 
-    @Test
-    func fillsInTheRestOfTheStackFromASingleAssignedPart() async {
-        let stub = StubGitHubService()
-        stub.result = PRFetchResult(
-            pullRequests: [stackedPR(3, position: 3, size: 4, type: .reviewing)],
-            isPartial: false
-        )
-        stub.stackParts = [
-            stackedPR(1, position: 1, size: 4, type: .reviewing),
-            stackedPR(2, position: 2, size: 4, type: .reviewing),
-            stackedPR(4, position: 4, size: 4, type: .reviewing),
-        ]
-
+    private func makeVM(stub: StubGitHubService) async -> PRMonitorViewModel {
         let vm = withDependencies {
             $0.userDefaults = UserDefaultsStore.testSuite()
             $0.watchlistService = WatchlistService()
@@ -1228,6 +1220,23 @@ struct StackCompletionTests {
             if vm.lastRefreshTime != nil { break }
             try? await Task.sleep(for: .milliseconds(25))
         }
+        return vm
+    }
+
+    @Test
+    func fillsInTheRestOfTheStackFromASingleAssignedPart() async {
+        let stub = StubGitHubService()
+        stub.result = PRFetchResult(
+            pullRequests: [stackedPR(3, position: 3, size: 4, type: .reviewing)],
+            isPartial: false
+        )
+        stub.stackParts = [
+            stackedPR(1, position: 1, size: 4, type: .reviewing),
+            stackedPR(2, position: 2, size: 4, type: .reviewing),
+            stackedPR(4, position: 4, size: 4, type: .reviewing),
+        ]
+
+        let vm = await makeVM(stub: stub)
 
         await vm.refresh()
 
@@ -1256,25 +1265,37 @@ struct StackCompletionTests {
         )
         stub.stackParts = [stackedPR(99, position: 1, size: 2, type: .reviewing)]
 
-        let vm = withDependencies {
-            $0.userDefaults = UserDefaultsStore.testSuite()
-            $0.watchlistService = WatchlistService()
-            $0.notificationService = NotificationService()
-            $0.otherPRsService = OtherPRsService()
-            $0.customNamesService = CustomNamesService()
-            $0.cacheService = PRCacheService()
-            $0[GitHubServiceKey.self] = stub
-        } operation: {
-            PRMonitorViewModel(isDemoMode: false)
-        }
-        vm.stopPolling()
-        for _ in 0..<40 {
-            if vm.lastRefreshTime != nil { break }
-            try? await Task.sleep(for: .milliseconds(25))
-        }
+        let vm = await makeVM(stub: stub)
 
         await vm.refresh()
 
         #expect(vm.reviewPRs.map(\.number) == [1, 2])
+    }
+
+    @Test
+    func accountsForMergedLowerPartsInTheHeader() async {
+        let stub = StubGitHubService()
+        stub.result = PRFetchResult(
+            pullRequests: [
+                stackedPR(2, position: 2, size: 3, type: .reviewing),
+                stackedPR(3, position: 3, size: 3, type: .reviewing),
+            ],
+            isPartial: false
+        )
+        stub.stackMergedPositions = [1]
+
+        let vm = await makeVM(stub: stub)
+
+        await vm.refresh()
+
+        #expect(vm.reviewPRs.map(\.number) == [2, 3])
+
+        let rows = vm.sectionRows(for: .reviewing)
+        guard case .stackHeader(let header) = rows.first else {
+            Issue.record("Expected a stack header")
+            return
+        }
+        #expect(header.readiness.landedPositions == [1])
+        #expect(header.summary == "Part 1 merged · All remaining parts are ready to merge")
     }
 }

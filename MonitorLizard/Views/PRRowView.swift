@@ -98,47 +98,9 @@ struct PRRowView: View {
         }
     }
 
-    private var watchHelpText: String {
-        let memberCount = viewModel.stackMemberCount(for: pr)
-        if pr.isWatched {
-            return memberCount > 1 ? "Stop watching this stack (\(memberCount) PRs)" : "Stop watching this PR"
-        }
-        return memberCount > 1 ? "Watch this stack (\(memberCount) PRs)" : "Watch this PR for completion"
-    }
-
     private var failingChecks: [StatusCheck] {
         pr.statusChecks.filter { check in
             !check.isNonBlocking && (check.status == .failure || check.status == .error)
-        }
-    }
-
-    private func showRenameDialog() {
-        NSApp.windows.forEach { window in
-            if window is NSPanel { window.orderOut(nil) }
-        }
-        DispatchQueue.main.async {
-            let alert = NSAlert()
-            alert.messageText = "Custom Display Name"
-            alert.informativeText = "Enter a name to override the GitHub title, or clear it to restore the original."
-            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-            field.stringValue = pr.customName ?? ""
-            field.placeholderString = pr.title
-            alert.accessoryView = field
-            alert.addButton(withTitle: "Save")
-            alert.addButton(withTitle: "Cancel")
-            if pr.customName != nil {
-                alert.addButton(withTitle: "Reset to GitHub Title")
-            }
-            let response = alert.runModal()
-            switch response {
-            case .alertFirstButtonReturn:
-                let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                viewModel.renamePR(pr, to: name.isEmpty ? nil : name)
-            case .alertThirdButtonReturn:
-                viewModel.renamePR(pr, to: nil)
-            default:
-                break
-            }
         }
     }
 
@@ -213,7 +175,10 @@ struct PRRowView: View {
     var body: some View {
         Group {
             if let stackContext {
-                compactBody(stackContext)
+                HStack(spacing: 12) {
+                    compactBody(stackContext)
+                    PRRowActions(pr: pr, isHovering: isHovering, onOpen: openPRURL)
+                }
             } else {
                 fullBody
             }
@@ -472,114 +437,166 @@ struct PRRowView: View {
 
             Spacer()
 
-            // Action buttons - 2x2 grid: [Watch, Open] / [Delete, Rename]
-            // Always occupies space; opacity controls visibility.
-            VStack(spacing: 0) {
-                Spacer(minLength: 0)
-                VStack(spacing: 6) {
-                    // Top row: Watch + Open
-                    HStack(spacing: 8) {
-                        // Watch - fixed cell; hidden when no status checks
-                        if pr.hasStatusChecks {
-                            Button(action: { viewModel.toggleWatch(for: pr) }) {
-                                Image(systemName: pr.isWatched ? "eye.fill" : "eye")
-                                    .font(.system(size: 13))
-                                    .foregroundColor(pr.isWatched ? .blue : .gray)
-                            }
-                            .buttonStyle(.plain)
-                            .help(watchHelpText)
-                            .opacity(isHovering || pr.isWatched ? 1.0 : 0.0)
-                            .frame(width: 16, height: 16)
-                        } else {
-                            Color.clear.frame(width: 16, height: 16)
-                        }
-
-                        // Open in browser
-                        Button(action: openPRURL) {
-                            Image(systemName: "arrow.up.right.square")
-                                .font(.system(size: 13))
-                                .foregroundColor(.gray)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Open in GitHub")
-                        .opacity(isHovering ? 1.0 : 0.0)
-                        .frame(width: 16, height: 16)
-                    }
-                    .frame(width: 64, alignment: .trailing)
-
-                    // Bottom row: Delete (Other PRs only) + Copy Link + Rename
-                    // Right-aligned to match top row's rightmost icon
-                    HStack(spacing: 8) {
-                        if pr.type == .other && viewModel.isPinnedPR(pr) {
-                            Button(action: {
-                                NSApp.windows.forEach { window in
-                                    if window is NSPanel { window.orderOut(nil) }
-                                }
-                                DispatchQueue.main.async {
-                                    let alert = NSAlert()
-                                    alert.messageText = "Remove from Other PRs?"
-                                    alert.informativeText = "\"\(pr.displayTitle)\" will be removed from Other PRs."
-                                    alert.addButton(withTitle: "Remove")
-                                    alert.addButton(withTitle: "Cancel")
-                                    alert.alertStyle = .warning
-                                    if alert.runModal() == .alertFirstButtonReturn {
-                                        viewModel.removeOtherPR(pr)
-                                    }
-                                }
-                            }) {
-                                Image(systemName: "trash")
-                                    .font(.system(size: 13))
-                                    .foregroundColor(.red)
-                            }
-                            .buttonStyle(.plain)
-                            .help("Remove from Other PRs")
-                            .opacity(isHovering ? 1.0 : 0.0)
-                            .frame(width: 16, height: 16)
-                        }
-
-                        Button(action: {
-                            viewModel.copyPRLink(for: pr)
-                        }) {
-                            Image(systemName: "link")
-                                .font(.system(size: 11, weight: .bold))
-                                .foregroundColor(.gray)
-                        }
-                        .buttonStyle(.plain)
-                        .help(viewModel.copiedPRID == pr.id ? "Copied!" : "Copy PR link")
-                        .opacity(isHovering ? 1.0 : 0.0)
-                        .frame(width: 16, height: 16)
-                        .overlay(
-                            Text("Copied")
-                                .font(.caption2)
-                                .fontWeight(.medium)
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 3)
-                                .background(Color.black.opacity(0.75))
-                                .cornerRadius(4)
-                                .fixedSize()
-                                .offset(y: 22)
-                                .opacity(viewModel.copiedPRID == pr.id ? 1.0 : 0.0)
-                                .animation(.easeInOut(duration: 0.15), value: viewModel.copiedPRID),
-                            alignment: .bottom
-                        )
-
-                        Button(action: showRenameDialog) {
-                            Image(systemName: "pencil")
-                                .font(.system(size: 13))
-                                .foregroundColor(pr.customName != nil ? .blue : .gray)
-                        }
-                        .buttonStyle(.plain)
-                        .help(pr.customName != nil ? "Edit custom name" : "Set custom name")
-                        .opacity(isHovering ? 1.0 : 0.0)
-                        .frame(width: 16, height: 16)
-                    }
-                    .frame(width: 64, alignment: .trailing)
-                }
-                Spacer(minLength: 0)
-            }
-            .frame(width: 64, alignment: .trailing) // Fixed width: fits 3-icon row (Other PRs)
+            PRRowActions(pr: pr, isHovering: isHovering, onOpen: openPRURL)
         }
+    }
+}
+
+/// The per-PR action column: watch, open, copy link, rename, and remove for pinned
+/// PRs. Shared by full rows and stacked part rows; the buttons reveal on hover.
+private struct PRRowActions: View {
+    let pr: PullRequest
+    let isHovering: Bool
+    let onOpen: () -> Void
+
+    @EnvironmentObject var viewModel: PRMonitorViewModel
+
+    private var watchHelpText: String {
+        let memberCount = viewModel.stackMemberCount(for: pr)
+        if pr.isWatched {
+            return memberCount > 1 ? "Stop watching this stack (\(memberCount) PRs)" : "Stop watching this PR"
+        }
+        return memberCount > 1 ? "Watch this stack (\(memberCount) PRs)" : "Watch this PR for completion"
+    }
+
+    private func showRenameDialog() {
+        NSApp.windows.forEach { window in
+            if window is NSPanel { window.orderOut(nil) }
+        }
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "Custom Display Name"
+            alert.informativeText = "Enter a name to override the GitHub title, or clear it to restore the original."
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+            field.stringValue = pr.customName ?? ""
+            field.placeholderString = pr.title
+            alert.accessoryView = field
+            alert.addButton(withTitle: "Save")
+            alert.addButton(withTitle: "Cancel")
+            if pr.customName != nil {
+                alert.addButton(withTitle: "Reset to GitHub Title")
+            }
+            let response = alert.runModal()
+            switch response {
+            case .alertFirstButtonReturn:
+                let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                viewModel.renamePR(pr, to: name.isEmpty ? nil : name)
+            case .alertThirdButtonReturn:
+                viewModel.renamePR(pr, to: nil)
+            default:
+                break
+            }
+        }
+    }
+
+    private func removeFromOtherPRs() {
+        NSApp.windows.forEach { window in
+            if window is NSPanel { window.orderOut(nil) }
+        }
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "Remove from Other PRs?"
+            alert.informativeText = "\"\(pr.displayTitle)\" will be removed from Other PRs."
+            alert.addButton(withTitle: "Remove")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+            if alert.runModal() == .alertFirstButtonReturn {
+                viewModel.removeOtherPR(pr)
+            }
+        }
+    }
+
+    var body: some View {
+        // 2x2 grid: [Watch, Open] / [Delete, Copy, Rename]
+        // Always occupies space; opacity controls visibility.
+        VStack(spacing: 0) {
+            Spacer(minLength: 0)
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    // Watch - fixed cell; hidden when no status checks
+                    if pr.hasStatusChecks {
+                        Button(action: { viewModel.toggleWatch(for: pr) }) {
+                            Image(systemName: pr.isWatched ? "eye.fill" : "eye")
+                                .font(.system(size: 13))
+                                .foregroundColor(pr.isWatched ? .blue : .gray)
+                        }
+                        .buttonStyle(.plain)
+                        .help(watchHelpText)
+                        .opacity(isHovering || pr.isWatched ? 1.0 : 0.0)
+                        .frame(width: 16, height: 16)
+                    } else {
+                        Color.clear.frame(width: 16, height: 16)
+                    }
+
+                    // Open in browser
+                    Button(action: onOpen) {
+                        Image(systemName: "arrow.up.right.square")
+                            .font(.system(size: 13))
+                            .foregroundColor(.gray)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open in GitHub")
+                    .opacity(isHovering ? 1.0 : 0.0)
+                    .frame(width: 16, height: 16)
+                }
+                .frame(width: 64, alignment: .trailing)
+
+                // Bottom row: Delete (pinned Other PRs only) + Copy Link + Rename
+                HStack(spacing: 8) {
+                    if pr.type == .other && viewModel.isPinnedPR(pr) {
+                        Button(action: removeFromOtherPRs) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 13))
+                                .foregroundColor(.red)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Remove from Other PRs")
+                        .opacity(isHovering ? 1.0 : 0.0)
+                        .frame(width: 16, height: 16)
+                    }
+
+                    Button(action: {
+                        viewModel.copyPRLink(for: pr)
+                    }) {
+                        Image(systemName: "link")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(.gray)
+                    }
+                    .buttonStyle(.plain)
+                    .help(viewModel.copiedPRID == pr.id ? "Copied!" : "Copy PR link")
+                    .opacity(isHovering ? 1.0 : 0.0)
+                    .frame(width: 16, height: 16)
+                    .overlay(
+                        Text("Copied")
+                            .font(.caption2)
+                            .fontWeight(.medium)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(Color.black.opacity(0.75))
+                            .cornerRadius(4)
+                            .fixedSize()
+                            .offset(y: 22)
+                            .opacity(viewModel.copiedPRID == pr.id ? 1.0 : 0.0)
+                            .animation(.easeInOut(duration: 0.15), value: viewModel.copiedPRID),
+                        alignment: .bottom
+                    )
+
+                    Button(action: showRenameDialog) {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 13))
+                            .foregroundColor(pr.customName != nil ? .blue : .gray)
+                    }
+                    .buttonStyle(.plain)
+                    .help(pr.customName != nil ? "Edit custom name" : "Set custom name")
+                    .opacity(isHovering ? 1.0 : 0.0)
+                    .frame(width: 16, height: 16)
+                }
+                .frame(width: 64, alignment: .trailing)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(width: 64, alignment: .trailing) // Fixed width: fits 3-icon row (Other PRs)
     }
 }
 

@@ -144,6 +144,35 @@ struct PRCacheServiceTests {
     }
 
     @Test
+    func decodesCachedStackWithoutMergedPositions() throws {
+        // Caches written before merged-part tracking have a stack but no
+        // "mergedPositions" key; those entries must still load.
+        let legacyJSON = """
+        [{
+          "number": 2,
+          "title": "Stacked PR",
+          "repository": { "name": "repo", "nameWithOwner": "owner/repo" },
+          "url": "https://github.com/owner/repo/pull/2",
+          "author": { "login": "testuser" },
+          "headRefName": "feature/test",
+          "updatedAt": 1000000,
+          "buildStatus": "success",
+          "isWatched": false,
+          "labels": [],
+          "type": "authored",
+          "isDraft": false,
+          "statusChecks": [],
+          "host": "github.com",
+          "stack": { "id": "ST_stack", "number": 7, "size": 2, "position": 1 }
+        }]
+        """
+        let prs = try JSONDecoder().decode([PullRequest].self, from: Data(legacyJSON.utf8))
+
+        #expect(prs.count == 1)
+        #expect(prs[0].stack?.mergedPositions == nil)
+    }
+
+    @Test
     func subsequentSaveOverwritesPrevious() {
         let service = makeService()
         service.save(mainPRs: [makePR(number: 1)], otherPRs: [])

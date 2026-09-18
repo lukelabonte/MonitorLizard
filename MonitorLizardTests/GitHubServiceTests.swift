@@ -669,7 +669,7 @@ struct GitHubServiceBatchIntegrationTests {
         )
         let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }
 
-        let parts = try await service.fetchMissingStackParts(
+        let completion = try await service.fetchMissingStackParts(
             stackID: "PRS_stack",
             host: "github.com",
             owner: "acme",
@@ -680,9 +680,10 @@ struct GitHubServiceBatchIntegrationTests {
             inactiveThresholdDays: 3
         )
 
-        #expect(parts.map(\.number) == [101, 104])
-        #expect(parts.map { $0.stack?.position } == [1, 4])
-        #expect(parts.allSatisfy { $0.type == .reviewing })
+        #expect(completion.missingParts.map(\.number) == [101, 104])
+        #expect(completion.missingParts.map { $0.stack?.position } == [1, 4])
+        #expect(completion.missingParts.allSatisfy { $0.type == .reviewing })
+        #expect(completion.mergedPositions == [3])
     }
 
     @Test func fetchMissingStackPartsReturnsNothingWhenEveryPartIsKnown() async throws {
@@ -693,7 +694,7 @@ struct GitHubServiceBatchIntegrationTests {
         )
         let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }
 
-        let parts = try await service.fetchMissingStackParts(
+        let completion = try await service.fetchMissingStackParts(
             stackID: "PRS_stack",
             host: "github.com",
             owner: "acme",
@@ -704,7 +705,8 @@ struct GitHubServiceBatchIntegrationTests {
             inactiveThresholdDays: 3
         )
 
-        #expect(parts.isEmpty)
+        #expect(completion.missingParts.isEmpty)
+        #expect(completion.mergedPositions == [3])
     }
 
     @Test func fetchAllOpenPRsRemembersHostsWithoutStackInfo() async throws {

@@ -376,13 +376,22 @@ class PRMonitorViewModel: ObservableObject {
                   let numbers = knownNumbers[stack.id],
                   numbers.count < stack.size else { continue }
 
-            let parts = await missingParts(for: anchor, stack: stack, knownNumbers: numbers)
-                .filter { !knownIDs.contains($0.id) }
+            let completion = await missingParts(for: anchor, stack: stack, knownNumbers: numbers)
+            let parts = completion.missingParts.filter { !knownIDs.contains($0.id) }
 
             if mainPRs.contains(where: { $0.stack?.id == stack.id }) {
                 main.append(contentsOf: parts)
             } else {
                 other.append(contentsOf: parts)
+            }
+
+            // Record the merged positions on every part of this stack, so readiness
+            // and the header can account for rows GitHub no longer returns.
+            for index in main.indices where main[index].stack?.id == stack.id {
+                main[index].stack?.mergedPositions = completion.mergedPositions
+            }
+            for index in other.indices where other[index].stack?.id == stack.id {
+                other[index].stack?.mergedPositions = completion.mergedPositions
             }
         }
 
@@ -393,9 +402,9 @@ class PRMonitorViewModel: ObservableObject {
         for anchor: PullRequest,
         stack: PRStackInfo,
         knownNumbers: Set<Int>
-    ) async -> [PullRequest] {
+    ) async -> StackCompletion {
         let components = anchor.repository.nameWithOwner.split(separator: "/")
-        guard components.count == 2 else { return [] }
+        guard components.count == 2 else { return .empty }
 
         do {
             return try await githubService.fetchMissingStackParts(
@@ -411,7 +420,7 @@ class PRMonitorViewModel: ObservableObject {
         } catch {
             // Completing a stack is best-effort; a failure leaves the stack partial.
             print("Transient error completing stack #\(stack.number): \(error)")
-            return []
+            return .empty
         }
     }
 

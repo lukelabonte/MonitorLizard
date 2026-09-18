@@ -11,6 +11,7 @@ protocol GitHubServicing: Sendable {
 
     /// Fetches the open parts of a stack that are not in `knownNumbers`, so a stack
     /// renders as a whole even when only one of its PRs matched the user's searches.
+    /// Also reports the stack's merged positions.
     func fetchMissingStackParts(
         stackID: String,
         host: String,
@@ -20,7 +21,7 @@ protocol GitHubServicing: Sendable {
         type: PRType,
         enableInactiveDetection: Bool,
         inactiveThresholdDays: Int
-    ) async throws -> [PullRequest]
+    ) async throws -> StackCompletion
 }
 
 /// Result of fetching PRs, including whether the results may be incomplete.
@@ -30,6 +31,17 @@ protocol GitHubServicing: Sendable {
 struct PRFetchResult {
     let pullRequests: [PullRequest]
     let isPartial: Bool
+}
+
+/// Result of completing a partial stack: the open parts that were missing from the
+/// user's lists, plus the positions whose pull request has already merged. GitHub
+/// keeps merged pull requests in the stack, so those positions are occupied but
+/// never show up in searches.
+struct StackCompletion {
+    let missingParts: [PullRequest]
+    let mergedPositions: [Int]
+
+    static let empty = StackCompletion(missingParts: [], mergedPositions: [])
 }
 
 /// Service for interacting with GitHub via the `gh` CLI tool
@@ -1074,7 +1086,8 @@ class GitHubService: GitHubServicing, ObservableObject {
 
     /// Fetches the open parts of a stack that are not in `knownNumbers`, so a stack
     /// renders as a whole even when only one of its PRs matched the user's searches.
-    /// Parts that are already gone, closed, or no longer in a stack are skipped.
+    /// Also reports which positions have already merged. Parts that are gone, closed,
+    /// or no longer in a stack are skipped.
     func fetchMissingStackParts(
         stackID: String,
         host: String,
@@ -1084,8 +1097,8 @@ class GitHubService: GitHubServicing, ObservableObject {
         type: PRType,
         enableInactiveDetection: Bool,
         inactiveThresholdDays: Int
-    ) async throws -> [PullRequest] {
-        guard !owner.isEmpty, !repo.isEmpty else { return [] }
+    ) async throws -> StackCompletion {
+        guard !owner.isEmpty, !repo.isEmpty else { return .empty }
 
         let json = try await executeGraphQL(host: host) { _ in
             GitHubService.buildStackEntriesQuery(stackID: stackID)
@@ -1093,14 +1106,23 @@ class GitHubService: GitHubServicing, ObservableObject {
         guard let data = json.data(using: .utf8),
               let response = try? JSONDecoder().decode(StackEntriesResponse.self, from: data),
               let stack = response.data?.node else {
-            return []
+            return .empty
         }
 
         var parts: [PullRequest] = []
+        var mergedPositions: [Int] = []
         for entry in stack.entries.nodes {
-            guard let entryPR = entry.pullRequest,
-                  entryPR.state?.uppercased() == "OPEN",
-                  !knownNumbers.contains(entryPR.number) else { continue }
+            guard let entryPR = entry.pullRequest else { continue }
+
+            let state = entryPR.state?.uppercased()
+            if state == "MERGED" {
+                if let position = entry.position {
+                    mergedPositions.append(position)
+                }
+                continue
+            }
+
+            guard state == "OPEN", !knownNumbers.contains(entryPR.number) else { continue }
 
             let request = PRStatusRequest(owner: owner, repo: repo, number: entryPR.number)
             guard let detail = try await fetchPRDetail(for: request, host: host),
@@ -1116,7 +1138,7 @@ class GitHubService: GitHubServicing, ObservableObject {
                   part.stack != nil else { continue }
             parts.append(part)
         }
-        return parts
+        return StackCompletion(missingParts: parts, mergedPositions: mergedPositions.sorted())
     }
 
     /// Builds a PullRequest from a single-PR detail response. Shared by the Other

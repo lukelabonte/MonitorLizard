@@ -15,6 +15,12 @@ struct PRStackInfo: Hashable, Codable {
     /// This pull request's position in the stack, where 1 is closest to the base branch.
     let position: Int
 
+    /// Positions in this stack whose pull request has already merged, as reported
+    /// by the stack entries lookup. Nil until the app has looked the stack up.
+    /// GitHub keeps merged pull requests in the stack, so their rows never show up
+    /// in the user's own searches and the positions stay occupied.
+    var mergedPositions: [Int]?
+
     /// Short label matching GitHub's stack chip (e.g. "1/4").
     var positionLabel: String {
         "\(position)/\(size)"
@@ -52,26 +58,36 @@ struct PRStackHeader: Hashable, Identifiable {
 
     var id: String { "stack-\(stackID)" }
 
-    /// The part closest to the base branch, when it is visible.
-    var basePart: PRStackPart? {
-        visibleParts.first { $0.position == 1 }
+    /// The part to work on next, when its position can be named unambiguously:
+    /// every position below it is either visible or already merged.
+    var startPart: PRStackPart? {
+        guard let first = visibleParts.first else { return nil }
+        let lowerPositions = Set(1..<first.position)
+        let accounted = readiness.landedPositions.union(visibleParts.map(\.position))
+        return lowerPositions.isSubset(of: accounted) ? first : nil
     }
 
     /// One-line state summary shown next to the stack number.
     var summary: String {
+        let state: String
         switch readiness.status {
         case .allReady:
-            return "All \(size) parts are ready to merge"
+            state = readiness.landedPositions.isEmpty
+                ? "All \(size) parts are ready to merge"
+                : "All remaining parts are ready to merge"
         case .readyToAdvance:
-            if let basePart {
-                return "Ready to merge — start with #\(basePart.number)"
+            if let startPart {
+                state = "Ready to merge — start with #\(startPart.number)"
+            } else {
+                state = "Ready to merge"
             }
-            return "Ready to merge"
         case .blocked(let blocker):
-            return "Blocked by part \(blocker.position) (#\(blocker.number)) — \(blocker.reason)"
+            state = "Blocked by part \(blocker.position) (#\(blocker.number)) — \(blocker.reason)"
         case .unknown:
-            return "\(visibleParts.count) of \(size) parts in your lists"
+            state = "\(visibleParts.count) of \(size) parts in your lists"
         }
+        guard let landedText = readiness.landedText else { return state }
+        return "\(landedText) · \(state)"
     }
 
     /// Tooltip listing the parts the app can see.
@@ -123,7 +139,17 @@ struct PRStackReadiness: Hashable {
     let status: Status
     let size: Int
 
-    /// True when the lowest part is ready, whether or not the parts above it are.
+    /// Positions already merged, when the stack lookup reported them.
+    let landedPositions: Set<Int>
+
+    init(status: Status, size: Int, landedPositions: Set<Int> = []) {
+        self.status = status
+        self.size = size
+        self.landedPositions = landedPositions
+    }
+
+    /// True when the lowest unmerged part is ready, whether or not the parts above
+    /// it are.
     var isReadyToAdvance: Bool {
         switch status {
         case .allReady, .readyToAdvance: return true
@@ -131,19 +157,36 @@ struct PRStackReadiness: Hashable {
         }
     }
 
+    /// "Part 1 merged" / "Parts 1, 2 merged", or nil when nothing has merged.
+    var landedText: String? {
+        let positions = landedPositions.sorted()
+        guard !positions.isEmpty else { return nil }
+        if positions.count == 1 {
+            return "Part \(positions[0]) merged"
+        }
+        return "Parts \(positions.map(String.init).joined(separator: ", ")) merged"
+    }
+
     /// One-line explanation for tooltips, or nil when the stack's state cannot be
     /// judged.
     var helpText: String? {
+        let state: String
         switch status {
         case .allReady:
-            return "All \(size) parts are ready to merge."
+            state = landedPositions.isEmpty
+                ? "All \(size) parts are ready to merge."
+                : "All remaining parts are ready to merge."
         case .readyToAdvance:
-            return "Part 1 is ready to merge."
+            state = landedPositions.isEmpty
+                ? "Part 1 is ready to merge."
+                : "The next part is ready to merge."
         case .blocked(let blocker):
-            return "Waiting on part \(blocker.position) of \(size) (\(blocker.reason))."
+            state = "Waiting on part \(blocker.position) of \(size) (\(blocker.reason))."
         case .unknown:
             return nil
         }
+        guard let landedText else { return state }
+        return "\(landedText). \(state)"
     }
 }
 
@@ -249,6 +292,9 @@ enum PRStackOrdering {
         let ordered = members.sorted {
             ($0.stack?.position ?? 0) < ($1.stack?.position ?? 0)
         }
+        // Merged parts stay in the stack but never appear in the user's searches,
+        // so their positions count as satisfied rather than missing.
+        let landed = Set(members.compactMap { $0.stack?.mergedPositions }.first ?? [])
 
         if let blocker = ordered.first(where: { $0.isMergeBlocked }) {
             return PRStackReadiness(
@@ -257,16 +303,19 @@ enum PRStackOrdering {
                     number: blocker.number,
                     reason: blocker.mergeBlockReason ?? "not ready"
                 )),
-                size: stackSize
+                size: stackSize,
+                landedPositions: landed
             )
         }
 
-        let hasBase = ordered.contains { $0.stack?.position == 1 }
+        let hasBase = landed.contains(1) || ordered.contains { $0.stack?.position == 1 }
         guard hasBase else {
-            return PRStackReadiness(status: .unknown, size: stackSize)
+            return PRStackReadiness(status: .unknown, size: stackSize, landedPositions: landed)
         }
-        let status: PRStackReadiness.Status = ordered.count == stackSize ? .allReady : .readyToAdvance
-        return PRStackReadiness(status: status, size: stackSize)
+
+        let accounted = Set(ordered.compactMap { $0.stack?.position }).union(landed)
+        let status: PRStackReadiness.Status = accounted.count == stackSize ? .allReady : .readyToAdvance
+        return PRStackReadiness(status: status, size: stackSize, landedPositions: landed)
     }
 
     /// Stacks whose lowest part has just become ready to merge.

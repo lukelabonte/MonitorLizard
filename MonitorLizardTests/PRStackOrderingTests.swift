@@ -12,7 +12,8 @@ struct PRStackOrderingTests {
         stackSize: Int = 4,
         position: Int,
         status: BuildStatus = .success,
-        reviewDecision: ReviewDecision? = nil
+        reviewDecision: ReviewDecision? = nil,
+        mergedPositions: [Int]? = nil
     ) -> PullRequest {
         PullRequest(
             number: number,
@@ -30,7 +31,13 @@ struct PRStackOrderingTests {
             statusChecks: [],
             reviewDecision: reviewDecision,
             host: "github.com",
-            stack: PRStackInfo(id: stackID, number: stackNumber, size: stackSize, position: position)
+            stack: PRStackInfo(
+                id: stackID,
+                number: stackNumber,
+                size: stackSize,
+                position: position,
+                mergedPositions: mergedPositions
+            )
         )
     }
 
@@ -172,6 +179,36 @@ struct PRStackOrderingTests {
         }
     }
 
+    @Test func mergedLowerPartsAreAccountedForInTheHeader() {
+        let rows = PRStackOrdering.rows(from: [
+            makePR(2, stackSize: 3, position: 2, mergedPositions: [1]),
+            makePR(3, stackSize: 3, position: 3, mergedPositions: [1]),
+        ])
+
+        #expect(rows.compactMap(\.pr).map(\.number) == [2, 3])
+        let header = header(rows)
+        #expect(header?.readiness.status == .allReady)
+        #expect(header?.visibleParts.map(\.number) == [2, 3])
+        #expect(header?.summary == "Part 1 merged · All remaining parts are ready to merge")
+    }
+
+    @Test func mergedBaseNamesTheNextPartToMerge() {
+        let rows = PRStackOrdering.rows(from: [
+            makePR(2, stackSize: 3, position: 2, mergedPositions: [1]),
+        ])
+
+        #expect(header(rows)?.summary == "Part 1 merged · Ready to merge — start with #2")
+    }
+
+    @Test func mergedLowerPartsAndABlockedPartAreReportedTogether() {
+        let rows = PRStackOrdering.rows(from: [
+            makePR(2, stackSize: 3, position: 2, status: .failure, mergedPositions: [1]),
+            makePR(3, stackSize: 3, position: 3, mergedPositions: [1]),
+        ])
+
+        #expect(header(rows)?.summary == "Part 1 merged · Blocked by part 2 (#2) — failing checks")
+    }
+
     @Test func headerSummarizesTheStackState() {
         let blocked = header(PRStackOrdering.rows(from: [
             makePR(1, position: 1, status: .pending),
@@ -198,7 +235,8 @@ struct PRStackReadinessTests {
         position: Int,
         stackSize: Int,
         status: BuildStatus = .success,
-        reviewDecision: ReviewDecision? = nil
+        reviewDecision: ReviewDecision? = nil,
+        mergedPositions: [Int]? = nil
     ) -> PullRequest {
         PullRequest(
             number: number,
@@ -216,7 +254,13 @@ struct PRStackReadinessTests {
             statusChecks: [],
             reviewDecision: reviewDecision,
             host: "github.com",
-            stack: PRStackInfo(id: "stack-1", number: 42, size: stackSize, position: position)
+            stack: PRStackInfo(
+                id: "stack-1",
+                number: 42,
+                size: stackSize,
+                position: position,
+                mergedPositions: mergedPositions
+            )
         )
     }
 
@@ -279,6 +323,43 @@ struct PRStackReadinessTests {
         #expect(readiness.status == .readyToAdvance)
         #expect(readiness.isReadyToAdvance)
         #expect(readiness.helpText == "Part 1 is ready to merge.")
+    }
+
+    @Test func mergedBaseLetsTheStackAdvance() {
+        let readiness = PRStackOrdering.readiness(
+            of: [
+                makePR(2, position: 2, stackSize: 3, mergedPositions: [1]),
+                makePR(3, position: 3, stackSize: 3, mergedPositions: [1]),
+            ],
+            stackSize: 3
+        )
+
+        #expect(readiness.status == .allReady)
+        #expect(readiness.landedPositions == [1])
+        #expect(readiness.landedText == "Part 1 merged")
+        #expect(readiness.isReadyToAdvance)
+        #expect(readiness.helpText == "Part 1 merged. All remaining parts are ready to merge.")
+    }
+
+    @Test func mergedBaseWithMissingUpperPartsIsReadyToAdvance() {
+        let readiness = PRStackOrdering.readiness(
+            of: [makePR(2, position: 2, stackSize: 3, mergedPositions: [1])],
+            stackSize: 3
+        )
+
+        #expect(readiness.status == .readyToAdvance)
+        #expect(readiness.isReadyToAdvance)
+        #expect(readiness.helpText == "Part 1 merged. The next part is ready to merge.")
+    }
+
+    @Test func mergedTextListsEveryLandedPosition() {
+        let readiness = PRStackOrdering.readiness(
+            of: [makePR(3, position: 3, stackSize: 3, mergedPositions: [1, 2])],
+            stackSize: 3
+        )
+
+        #expect(readiness.landedText == "Parts 1, 2 merged")
+        #expect(readiness.status == .allReady)
     }
 
     @Test func unreadyPartWithoutVisibleBaseIsUnknown() {

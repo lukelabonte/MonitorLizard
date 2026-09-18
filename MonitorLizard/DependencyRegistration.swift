@@ -364,9 +364,9 @@ private struct UnimplementedShellExecutor: ShellExecuting {
         type: PRType,
         enableInactiveDetection: Bool,
         inactiveThresholdDays: Int
-    ) async throws -> [PullRequest] {
+    ) async throws -> StackCompletion {
         reportIssue("Unimplemented: GitHubServicing.fetchMissingStackParts called without a test override")
-        return []
+        return .empty
     }
 }
 
