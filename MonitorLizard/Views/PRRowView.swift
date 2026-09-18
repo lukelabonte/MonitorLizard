@@ -510,7 +510,7 @@ struct PRRowView: View {
                     // Bottom row: Delete (Other PRs only) + Copy Link + Rename
                     // Right-aligned to match top row's rightmost icon
                     HStack(spacing: 8) {
-                        if pr.type == .other {
+                        if pr.type == .other && viewModel.isPinnedPR(pr) {
                             Button(action: {
                                 NSApp.windows.forEach { window in
                                     if window is NSPanel { window.orderOut(nil) }

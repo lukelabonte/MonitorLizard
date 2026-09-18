@@ -1054,6 +1054,21 @@ private final class StubGitHubService: GitHubServicing {
     func fetchOtherPR(_ id: OtherPRIdentifier, enableInactiveDetection: Bool, inactiveThresholdDays: Int) async throws -> PullRequest? {
         nil
     }
+
+    var stackParts: [PullRequest] = []
+
+    func fetchMissingStackParts(
+        stackID: String,
+        host: String,
+        owner: String,
+        repo: String,
+        knownNumbers: Set<Int>,
+        type: PRType,
+        enableInactiveDetection: Bool,
+        inactiveThresholdDays: Int
+    ) async throws -> [PullRequest] {
+        stackParts.filter { !knownNumbers.contains($0.number) }
+    }
 }
 
 private final class StackReadySpy: NotificationServicing, @unchecked Sendable {
@@ -1155,5 +1170,111 @@ struct StackWatchNotificationTests {
 
         await vm.refresh()
         #expect(spy.notifications.count == 1, "A ready stack must only notify once")
+    }
+}
+
+@MainActor
+@Suite(.serialized)
+struct StackCompletionTests {
+
+    private func stackedPR(_ number: Int, position: Int, size: Int, type: PRType) -> PullRequest {
+        PullRequest(
+            number: number,
+            title: "PR #\(number)",
+            repository: PullRequest.RepositoryInfo(name: "widget", nameWithOwner: "acme/widget"),
+            url: "https://github.com/acme/widget/pull/\(number)",
+            author: PullRequest.Author(login: "alice"),
+            headRefName: "feature/\(number)",
+            updatedAt: Date(),
+            buildStatus: .success,
+            isWatched: false,
+            labels: [],
+            type: type,
+            isDraft: false,
+            statusChecks: [],
+            reviewDecision: nil,
+            host: "github.com",
+            stack: PRStackInfo(id: "ST_stack", number: 9, size: size, position: position)
+        )
+    }
+
+    @Test
+    func fillsInTheRestOfTheStackFromASingleAssignedPart() async {
+        let stub = StubGitHubService()
+        stub.result = PRFetchResult(
+            pullRequests: [stackedPR(3, position: 3, size: 4, type: .reviewing)],
+            isPartial: false
+        )
+        stub.stackParts = [
+            stackedPR(1, position: 1, size: 4, type: .reviewing),
+            stackedPR(2, position: 2, size: 4, type: .reviewing),
+            stackedPR(4, position: 4, size: 4, type: .reviewing),
+        ]
+
+        let vm = withDependencies {
+            $0.userDefaults = UserDefaultsStore.testSuite()
+            $0.watchlistService = WatchlistService()
+            $0.notificationService = NotificationService()
+            $0.otherPRsService = OtherPRsService()
+            $0.customNamesService = CustomNamesService()
+            $0.cacheService = PRCacheService()
+            $0[GitHubServiceKey.self] = stub
+        } operation: {
+            PRMonitorViewModel(isDemoMode: false)
+        }
+        vm.stopPolling()
+        // Let the poll started by init finish before the explicit refresh.
+        for _ in 0..<40 {
+            if vm.lastRefreshTime != nil { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        await vm.refresh()
+
+        #expect(vm.reviewPRs.map(\.number) == [1, 2, 3, 4])
+        #expect(vm.authoredPRs.isEmpty)
+
+        let rows = vm.sectionRows(for: .reviewing)
+        #expect(rows.count == 5)
+        guard case .stackHeader(let header) = rows.first else {
+            Issue.record("Expected a single stack block")
+            return
+        }
+        #expect(header.visibleParts.map(\.number) == [1, 2, 3, 4])
+        #expect(header.summary == "All 4 parts are ready to merge")
+    }
+
+    @Test
+    func leavesAStackAloneWhenItsPartsAreAllPresent() async {
+        let stub = StubGitHubService()
+        stub.result = PRFetchResult(
+            pullRequests: [
+                stackedPR(1, position: 1, size: 2, type: .reviewing),
+                stackedPR(2, position: 2, size: 2, type: .reviewing),
+            ],
+            isPartial: false
+        )
+        stub.stackParts = [stackedPR(99, position: 1, size: 2, type: .reviewing)]
+
+        let vm = withDependencies {
+            $0.userDefaults = UserDefaultsStore.testSuite()
+            $0.watchlistService = WatchlistService()
+            $0.notificationService = NotificationService()
+            $0.otherPRsService = OtherPRsService()
+            $0.customNamesService = CustomNamesService()
+            $0.cacheService = PRCacheService()
+            $0[GitHubServiceKey.self] = stub
+        } operation: {
+            PRMonitorViewModel(isDemoMode: false)
+        }
+        vm.stopPolling()
+        for _ in 0..<40 {
+            if vm.lastRefreshTime != nil { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        await vm.refresh()
+
+        #expect(vm.reviewPRs.map(\.number) == [1, 2])
     }
 }

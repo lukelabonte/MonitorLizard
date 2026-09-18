@@ -242,29 +242,31 @@ class PRMonitorViewModel: ObservableObject {
             let otherIDs = Set(fetchedOther.map { $0.id })
             let dedupedPRs = fetchedPRs.filter { !otherIDs.contains($0.id) }
 
-            let completed = watchlistService.checkForCompletions(currentPRs: dedupedPRs + fetchedOther)
+            let (mainPRs, otherPRs) = await completeStacks(mainPRs: dedupedPRs, otherPRs: fetchedOther)
+
+            let completed = watchlistService.checkForCompletions(currentPRs: mainPRs + otherPRs)
 
             for pr in completed {
                 notificationService.notifyBuildComplete(pr: pr, status: pr.buildStatus)
             }
 
-            unsortedPullRequests = applyCustomNames(dedupedPRs.map { pr in
+            unsortedPullRequests = applyCustomNames(mainPRs.map { pr in
                 var updated = pr
                 updated.isWatched = watchlistService.isWatched(pr)
                 return updated
             })
 
-            otherPullRequests = applyCustomNames(fetchedOther.map { pr in
+            otherPullRequests = applyCustomNames(otherPRs.map { pr in
                 var updated = pr
                 updated.isWatched = watchlistService.isWatched(pr)
                 return updated
             })
 
-            let activeIDs = Set((dedupedPRs + fetchedOther).map { $0.id })
+            let activeIDs = Set((mainPRs + otherPRs).map { $0.id })
             customNamesService.pruneStale(keeping: activeIDs)
 
             applySorting()
-            notifyReadyStacks(allPRs: dedupedPRs + fetchedOther)
+            notifyReadyStacks(allPRs: mainPRs + otherPRs)
 
             if !fetchResult.isPartial &&
                 selectedRepository != "All Repositories" &&
@@ -348,6 +350,71 @@ class PRMonitorViewModel: ObservableObject {
         return results
     }
 
+    /// Fetches the parts of any incomplete stack so a stack renders as a whole even
+    /// when only one of its PRs matched the user's searches. Companions join the
+    /// section of the stack's first anchor and share its type.
+    private func completeStacks(
+        mainPRs: [PullRequest],
+        otherPRs: [PullRequest]
+    ) async -> (main: [PullRequest], other: [PullRequest]) {
+        guard !isDemoMode else { return (mainPRs, otherPRs) }
+
+        let knownIDs = Set((mainPRs + otherPRs).map(\.id))
+        var knownNumbers: [String: Set<Int>] = [:]
+        for pr in mainPRs + otherPRs {
+            guard let stack = pr.stack else { continue }
+            knownNumbers[stack.id, default: []].insert(pr.number)
+        }
+
+        var main = mainPRs
+        var other = otherPRs
+        var visitedStacks: Set<String> = []
+
+        for anchor in mainPRs + otherPRs {
+            guard let stack = anchor.stack,
+                  visitedStacks.insert(stack.id).inserted,
+                  let numbers = knownNumbers[stack.id],
+                  numbers.count < stack.size else { continue }
+
+            let parts = await missingParts(for: anchor, stack: stack, knownNumbers: numbers)
+                .filter { !knownIDs.contains($0.id) }
+
+            if mainPRs.contains(where: { $0.stack?.id == stack.id }) {
+                main.append(contentsOf: parts)
+            } else {
+                other.append(contentsOf: parts)
+            }
+        }
+
+        return (main, other)
+    }
+
+    private func missingParts(
+        for anchor: PullRequest,
+        stack: PRStackInfo,
+        knownNumbers: Set<Int>
+    ) async -> [PullRequest] {
+        let components = anchor.repository.nameWithOwner.split(separator: "/")
+        guard components.count == 2 else { return [] }
+
+        do {
+            return try await githubService.fetchMissingStackParts(
+                stackID: stack.id,
+                host: anchor.host,
+                owner: String(components[0]),
+                repo: String(components[1]),
+                knownNumbers: knownNumbers,
+                type: anchor.type,
+                enableInactiveDetection: enableInactiveBranchDetection,
+                inactiveThresholdDays: inactiveBranchThresholdDays
+            )
+        } catch {
+            // Completing a stack is best-effort; a failure leaves the stack partial.
+            print("Transient error completing stack #\(stack.number): \(error)")
+            return []
+        }
+    }
+
     private func applySorting() {
         let authored = unsortedPullRequests.filter { $0.type == .authored }
         let review = unsortedPullRequests.filter { $0.type == .reviewing }
@@ -407,15 +474,26 @@ class PRMonitorViewModel: ObservableObject {
         applySorting()
     }
 
-    func removeOtherPR(_ pr: PullRequest) {
+    /// True when the user pinned this PR, as opposed to a stack companion that is
+    /// only in the list because another part of its stack is pinned.
+    func isPinnedPR(_ pr: PullRequest) -> Bool {
+        guard let id = otherPRIdentifier(for: pr) else { return false }
+        return otherPRsService.contains(id)
+    }
+
+    private func otherPRIdentifier(for pr: PullRequest) -> OtherPRIdentifier? {
         let parts = pr.repository.nameWithOwner.split(separator: "/")
-        guard parts.count == 2 else { return }
-        let id = OtherPRIdentifier(
+        guard parts.count == 2 else { return nil }
+        return OtherPRIdentifier(
             host: pr.host,
             owner: String(parts[0]),
             repo: String(parts[1]),
             number: pr.number
         )
+    }
+
+    func removeOtherPR(_ pr: PullRequest) {
+        guard let id = otherPRIdentifier(for: pr) else { return }
         otherPRsService.remove(id)
         customNamesService.removeName(for: pr.id)
         otherPullRequests.removeAll { $0.id == pr.id }

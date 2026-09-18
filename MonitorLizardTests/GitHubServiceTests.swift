@@ -610,6 +610,103 @@ struct GitHubServiceBatchIntegrationTests {
         #expect(queries.contains { !$0.contains("stackEntry") })
     }
 
+    private static func stackPartDetailJSON(number: Int, position: Int) -> String {
+        """
+        {
+          "data": {
+            "pr0": {
+              "pullRequest": {
+                "number": \(number),
+                "title": "Part \(number)",
+                "url": "https://github.com/acme/widget/pull/\(number)",
+                "author": { "login": "alice" },
+                "updatedAt": "2025-01-01T00:00:00Z",
+                "labels": { "nodes": [] },
+                "isDraft": false,
+                "state": "OPEN",
+                "headRefName": "feature/\(number)",
+                "statusCheckRollup": { "state": "SUCCESS", "contexts": { "nodes": [] } },
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "reviewDecision": null,
+                "latestReviews": { "nodes": [] },
+                "reviewRequests": { "nodes": [] },
+                "stackEntry": {
+                  "position": \(position),
+                  "stack": { "id": "PRS_stack", "number": 9, "size": 4 }
+                }
+              }
+            }
+          }
+        }
+        """
+    }
+
+    private static let stackEntriesResult = """
+    {
+      "data": {
+        "node": {
+          "entries": {
+            "nodes": [
+              { "position": 1, "pullRequest": { "number": 101, "state": "OPEN" } },
+              { "position": 2, "pullRequest": { "number": 102, "state": "OPEN" } },
+              { "position": 3, "pullRequest": { "number": 103, "state": "MERGED" } },
+              { "position": 4, "pullRequest": { "number": 104, "state": "OPEN" } }
+            ]
+          }
+        }
+      }
+    }
+    """
+
+    @Test func fetchMissingStackPartsReturnsOpenPartsThatAreNotKnown() async throws {
+        let mock = MockShellExecutor(
+            executeResponseMatchers: [
+                ("node(id:", .success(Self.stackEntriesResult)),
+                ("pullRequest(number: 101)", .success(Self.stackPartDetailJSON(number: 101, position: 1))),
+                ("pullRequest(number: 104)", .success(Self.stackPartDetailJSON(number: 104, position: 4))),
+            ]
+        )
+        let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }
+
+        let parts = try await service.fetchMissingStackParts(
+            stackID: "PRS_stack",
+            host: "github.com",
+            owner: "acme",
+            repo: "widget",
+            knownNumbers: [102],
+            type: .reviewing,
+            enableInactiveDetection: false,
+            inactiveThresholdDays: 3
+        )
+
+        #expect(parts.map(\.number) == [101, 104])
+        #expect(parts.map { $0.stack?.position } == [1, 4])
+        #expect(parts.allSatisfy { $0.type == .reviewing })
+    }
+
+    @Test func fetchMissingStackPartsReturnsNothingWhenEveryPartIsKnown() async throws {
+        let mock = MockShellExecutor(
+            executeResponseMatchers: [
+                ("node(id:", .success(Self.stackEntriesResult)),
+            ]
+        )
+        let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }
+
+        let parts = try await service.fetchMissingStackParts(
+            stackID: "PRS_stack",
+            host: "github.com",
+            owner: "acme",
+            repo: "widget",
+            knownNumbers: [101, 102, 103, 104],
+            type: .other,
+            enableInactiveDetection: false,
+            inactiveThresholdDays: 3
+        )
+
+        #expect(parts.isEmpty)
+    }
+
     @Test func fetchAllOpenPRsRemembersHostsWithoutStackInfo() async throws {
         let mock = Self.stackUnsupportedMock()
         let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }

@@ -354,6 +354,20 @@ private struct UnimplementedShellExecutor: ShellExecuting {
         reportIssue("Unimplemented: GitHubServicing.fetchOtherPR called without a test override")
         return nil
     }
+
+    func fetchMissingStackParts(
+        stackID: String,
+        host: String,
+        owner: String,
+        repo: String,
+        knownNumbers: Set<Int>,
+        type: PRType,
+        enableInactiveDetection: Bool,
+        inactiveThresholdDays: Int
+    ) async throws -> [PullRequest] {
+        reportIssue("Unimplemented: GitHubServicing.fetchMissingStackParts called without a test override")
+        return []
+    }
 }
 
 // MARK: - DependencyValues accessors

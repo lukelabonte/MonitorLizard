@@ -8,6 +8,19 @@ protocol GitHubServicing: Sendable {
     func fetchAllOpenPRs(enableInactiveDetection: Bool, inactiveThresholdDays: Int, isDemoMode: Bool) async throws -> PRFetchResult
     func fetchPRStatus(owner: String, repo: String, number: Int, updatedAt: Date, enableInactiveDetection: Bool, inactiveThresholdDays: Int, host: String) async throws -> (status: BuildStatus, headRefName: String, statusChecks: [StatusCheck], reviewDecision: ReviewDecision?)
     func fetchOtherPR(_ id: OtherPRIdentifier, enableInactiveDetection: Bool, inactiveThresholdDays: Int) async throws -> PullRequest?
+
+    /// Fetches the open parts of a stack that are not in `knownNumbers`, so a stack
+    /// renders as a whole even when only one of its PRs matched the user's searches.
+    func fetchMissingStackParts(
+        stackID: String,
+        host: String,
+        owner: String,
+        repo: String,
+        knownNumbers: Set<Int>,
+        type: PRType,
+        enableInactiveDetection: Bool,
+        inactiveThresholdDays: Int
+    ) async throws -> [PullRequest]
 }
 
 /// Result of fetching PRs, including whether the results may be incomplete.
@@ -253,11 +266,33 @@ class GitHubService: GitHubServicing, ObservableObject {
                   }
                 }
               }
-              \(stackEntryPlaceholder)
+                \(stackEntryPlaceholder)
             }
           }
         }
         """.replacingOccurrences(of: stackEntryPlaceholder, with: stackEntry)
+    }
+
+    /// Builds the query that lists a stack's parts, used to fill in the parts that
+    /// are not in the user's own PR lists.
+    nonisolated static func buildStackEntriesQuery(stackID: String) -> String {
+        """
+        query {
+          node(id: "\(stackID)") {
+            ... on PullRequestStack {
+              entries(first: 50) {
+                nodes {
+                  position
+                  pullRequest {
+                    number
+                    state
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
     }
 
     /// Parses a `gh api graphql` batch response and maps the per-alias results back to
@@ -1022,75 +1057,137 @@ class GitHubService: GitHubServicing, ObservableObject {
     /// Throws on transient errors (network, execution failures) so callers can
     /// distinguish "permanently gone" from "temporarily unavailable".
     func fetchOtherPR(_ id: OtherPRIdentifier, enableInactiveDetection: Bool, inactiveThresholdDays: Int) async throws -> PullRequest? {
-        let host = id.host
-        let owner = id.owner
-        let repo = id.repo
-        let number = id.number
-
-        let request = PRStatusRequest(owner: owner, repo: repo, number: number)
-        do {
-            guard let response = try await fetchPRDetail(for: request, host: host),
-                  response.state?.uppercased() == "OPEN",
-                  let responseNumber = response.number,
-                  let title = response.title,
-                  let url = response.url,
-                  let author = response.author,
-                  let updatedAtString = response.updatedAt,
-                  let isDraft = response.isDraft else {
-                return nil
-            }
-
-            let updatedAt = try parseDate(updatedAtString)
-            let statusCheckRollup = response.statusCheckRollup?.contexts?.nodes
-            let statusChecks = parseStatusChecks(
-                from: statusCheckRollup,
-                statusCheckRollupState: response.statusCheckRollup?.state,
-                requiredStatusCheckContexts: response.requiredStatusCheckContexts
-            )
-            let status = parseOverallStatus(
-                from: statusCheckRollup,
-                statusCheckRollupState: response.statusCheckRollup?.state,
-                mergeable: response.mergeable,
-                mergeStateStatus: response.mergeStateStatus,
-                requiredStatusCheckContexts: response.requiredStatusCheckContexts,
-                updatedAt: updatedAt,
-                enableInactiveDetection: enableInactiveDetection,
-                inactiveThresholdDays: inactiveThresholdDays
-            )
-            let reviewDecision = Self.resolveReviewDecision(
-                rawValue: response.reviewDecision,
-                latestReviews: response.latestReviews?.nodes,
-                reviewRequests: response.reviewRequests?.nodes?.map {
-                    GHPRDetailResponse.ReviewRequest(login: $0.requestedReviewer?.login)
-                }
-            )
-
-            return PullRequest(
-                number: responseNumber,
-                title: title,
-                repository: PullRequest.RepositoryInfo(
-                    name: repo,
-                    nameWithOwner: "\(owner)/\(repo)"
-                ),
-                url: url,
-                author: PullRequest.Author(login: author.login),
-                headRefName: response.headRefName,
-                updatedAt: updatedAt,
-                buildStatus: status,
-                isWatched: false,
-                labels: (response.labels?.nodes ?? []).map { label in
-                    PullRequest.Label(id: label.id, name: label.name, color: label.color)
-                },
-                type: .other,
-                isDraft: isDraft,
-                statusChecks: statusChecks,
-                reviewDecision: reviewDecision,
-                host: host,
-                stack: response.stackEntry?.stackInfo
-            )
-        } catch {
-            throw error
+        let request = PRStatusRequest(owner: id.owner, repo: id.repo, number: id.number)
+        guard let response = try await fetchPRDetail(for: request, host: id.host) else {
+            return nil
         }
+        return try buildPullRequest(
+            from: response,
+            owner: id.owner,
+            repo: id.repo,
+            type: .other,
+            host: id.host,
+            enableInactiveDetection: enableInactiveDetection,
+            inactiveThresholdDays: inactiveThresholdDays
+        )
+    }
+
+    /// Fetches the open parts of a stack that are not in `knownNumbers`, so a stack
+    /// renders as a whole even when only one of its PRs matched the user's searches.
+    /// Parts that are already gone, closed, or no longer in a stack are skipped.
+    func fetchMissingStackParts(
+        stackID: String,
+        host: String,
+        owner: String,
+        repo: String,
+        knownNumbers: Set<Int>,
+        type: PRType,
+        enableInactiveDetection: Bool,
+        inactiveThresholdDays: Int
+    ) async throws -> [PullRequest] {
+        guard !owner.isEmpty, !repo.isEmpty else { return [] }
+
+        let json = try await executeGraphQL(host: host) { _ in
+            GitHubService.buildStackEntriesQuery(stackID: stackID)
+        }
+        guard let data = json.data(using: .utf8),
+              let response = try? JSONDecoder().decode(StackEntriesResponse.self, from: data),
+              let stack = response.data?.node else {
+            return []
+        }
+
+        var parts: [PullRequest] = []
+        for entry in stack.entries.nodes {
+            guard let entryPR = entry.pullRequest,
+                  entryPR.state?.uppercased() == "OPEN",
+                  !knownNumbers.contains(entryPR.number) else { continue }
+
+            let request = PRStatusRequest(owner: owner, repo: repo, number: entryPR.number)
+            guard let detail = try await fetchPRDetail(for: request, host: host),
+                  let part = try buildPullRequest(
+                      from: detail,
+                      owner: owner,
+                      repo: repo,
+                      type: type,
+                      host: host,
+                      enableInactiveDetection: enableInactiveDetection,
+                      inactiveThresholdDays: inactiveThresholdDays
+                  ),
+                  part.stack != nil else { continue }
+            parts.append(part)
+        }
+        return parts
+    }
+
+    /// Builds a PullRequest from a single-PR detail response. Shared by the Other
+    /// PRs list and by stack parts fetched to complete a stack.
+    private func buildPullRequest(
+        from response: BatchPRStatusResponse,
+        owner: String,
+        repo: String,
+        type: PRType,
+        host: String,
+        enableInactiveDetection: Bool,
+        inactiveThresholdDays: Int
+    ) throws -> PullRequest? {
+        guard response.state?.uppercased() == "OPEN",
+              let responseNumber = response.number,
+              let title = response.title,
+              let url = response.url,
+              let author = response.author,
+              let updatedAtString = response.updatedAt,
+              let isDraft = response.isDraft else {
+            return nil
+        }
+
+        let updatedAt = try parseDate(updatedAtString)
+        let statusCheckRollup = response.statusCheckRollup?.contexts?.nodes
+        let statusChecks = parseStatusChecks(
+            from: statusCheckRollup,
+            statusCheckRollupState: response.statusCheckRollup?.state,
+            requiredStatusCheckContexts: response.requiredStatusCheckContexts
+        )
+        let status = parseOverallStatus(
+            from: statusCheckRollup,
+            statusCheckRollupState: response.statusCheckRollup?.state,
+            mergeable: response.mergeable,
+            mergeStateStatus: response.mergeStateStatus,
+            requiredStatusCheckContexts: response.requiredStatusCheckContexts,
+            updatedAt: updatedAt,
+            enableInactiveDetection: enableInactiveDetection,
+            inactiveThresholdDays: inactiveThresholdDays
+        )
+        let reviewDecision = Self.resolveReviewDecision(
+            rawValue: response.reviewDecision,
+            latestReviews: response.latestReviews?.nodes,
+            reviewRequests: response.reviewRequests?.nodes?.map {
+                GHPRDetailResponse.ReviewRequest(login: $0.requestedReviewer?.login)
+            }
+        )
+
+        return PullRequest(
+            number: responseNumber,
+            title: title,
+            repository: PullRequest.RepositoryInfo(
+                name: repo,
+                nameWithOwner: "\(owner)/\(repo)"
+            ),
+            url: url,
+            author: PullRequest.Author(login: author.login),
+            headRefName: response.headRefName,
+            updatedAt: updatedAt,
+            buildStatus: status,
+            isWatched: false,
+            labels: (response.labels?.nodes ?? []).map { label in
+                PullRequest.Label(id: label.id, name: label.name, color: label.color)
+            },
+            type: type,
+            isDraft: isDraft,
+            statusChecks: statusChecks,
+            reviewDecision: reviewDecision,
+            host: host,
+            stack: response.stackEntry?.stackInfo
+        )
     }
 
     private func fetchPRDetail(for request: PRStatusRequest, host: String) async throws -> BatchPRStatusResponse? {

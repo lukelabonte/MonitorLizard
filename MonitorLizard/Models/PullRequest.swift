@@ -370,6 +370,34 @@ struct BatchGraphQLResponse: Codable {
     }
 }
 
+/// Response of the stack entries query (`node(id:)` on a PullRequestStack).
+/// Lists the stack's parts so PRs missing from the user's lists can be added.
+struct StackEntriesResponse: Codable {
+    let data: DataNode?
+
+    struct DataNode: Codable {
+        let node: Stack?
+    }
+
+    struct Stack: Codable {
+        let entries: Entries
+
+        struct Entries: Codable {
+            let nodes: [Entry]
+        }
+
+        struct Entry: Codable {
+            let position: Int?
+            let pullRequest: Part?
+
+            struct Part: Codable {
+                let number: Int
+                let state: String?
+            }
+        }
+    }
+}
+
 struct GHPRDetailResponse: Codable {
     let headRefName: String
     let statusCheckRollup: [StatusCheck]?
