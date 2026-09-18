@@ -52,6 +52,9 @@ struct StackHeaderView: View {
 
     var body: some View {
         HStack(spacing: 8) {
+            // The padding lives inside the button so the whole strip, including the
+            // space around the chevron, is clickable. Backed by a content shape,
+            // the hit area stays this size even though the chevron is 10 pt wide.
             Button(action: { viewModel.toggleStackCollapse(header.stackID) }) {
                 HStack(spacing: 8) {
                     Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
@@ -75,6 +78,9 @@ struct StackHeaderView: View {
 
                     Spacer(minLength: 0)
                 }
+                .padding(.leading, 12)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help(header.helpText)
@@ -105,9 +111,7 @@ struct StackHeaderView: View {
             .frame(width: 16, height: 16)
             .accessibilityLabel("Open all PRs in this stack")
         }
-        .padding(.leading, 12)
         .padding(.trailing, 12)
-        .padding(.vertical, 8)
         .background(Color.gray.opacity(isHovering ? 0.1 : 0.05))
         .contentShape(Rectangle())
         .onContinuousHover { phase in
