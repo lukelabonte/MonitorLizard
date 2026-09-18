@@ -49,6 +49,10 @@ class PRMonitorViewModel: ObservableObject {
     private var copiedPRLinkTask: Task<Void, Never>?
     private var readyStackIDs: Set<String> = []
 
+    /// Stack blocks the user collapsed, by stack id. Session state: a freshly
+    /// launched app starts with every block expanded.
+    @Published private(set) var collapsedStackIDs: Set<String> = []
+
     var copyClearTask: Task<Void, Never>? { copiedPRLinkTask }
 
     var selectedRepository: String {
@@ -108,25 +112,25 @@ class PRMonitorViewModel: ObservableObject {
         })
     }
 
-    /// PRs for a section in display order, with members of the same stack kept
-    /// adjacent in GitHub's stack-popover order (base at the bottom).
-    func sectionItems(for type: PRType) -> [PRListItem] {
-        PRStackOrdering.items(from: visiblePRs(for: type))
+    /// Rows for a section: unstacked PRs as-is, each stack as one block (header plus
+    /// its parts, newest part first so the base sits at the bottom).
+    func sectionRows(for type: PRType) -> [PRListRow] {
+        PRStackOrdering.rows(from: sectionPRs(for: type), collapsedStackIDs: collapsedStackIDs)
     }
 
     var authoredPRs: [PullRequest] {
-        sectionItems(for: .authored).map(\.pr)
+        PRStackOrdering.rows(from: sectionPRs(for: .authored)).compactMap(\.pr)
     }
 
     var reviewPRs: [PullRequest] {
-        sectionItems(for: .reviewing).map(\.pr)
+        PRStackOrdering.rows(from: sectionPRs(for: .reviewing)).compactMap(\.pr)
     }
 
     var filteredOtherPRs: [PullRequest] {
-        sectionItems(for: .other).map(\.pr)
+        PRStackOrdering.rows(from: sectionPRs(for: .other)).compactMap(\.pr)
     }
 
-    private func visiblePRs(for type: PRType) -> [PullRequest] {
+    private func sectionPRs(for type: PRType) -> [PullRequest] {
         switch type {
         case .reviewing:
             guard showReviewPRs else { return [] }
@@ -458,10 +462,48 @@ class PRMonitorViewModel: ObservableObject {
         stackMembers(of: pr).count
     }
 
+    func toggleStackCollapse(_ stackID: String) {
+        if collapsedStackIDs.contains(stackID) {
+            collapsedStackIDs.remove(stackID)
+        } else {
+            collapsedStackIDs.insert(stackID)
+        }
+    }
+
+    func isStackCollapsed(_ stackID: String) -> Bool {
+        collapsedStackIDs.contains(stackID)
+    }
+
+    /// Number of stack parts the app knows about for the given stack id.
+    func stackMemberCount(forStackID stackID: String) -> Int {
+        stackMembers(stackID: stackID).count
+    }
+
+    /// The stack's known parts in merge order (part 1 first), for opening them all.
+    func stackParts(inStack stackID: String) -> [PullRequest] {
+        stackMembers(stackID: stackID).sorted {
+            ($0.stack?.position ?? 0) < ($1.stack?.position ?? 0)
+        }
+    }
+
+    func isStackWatched(_ stackID: String) -> Bool {
+        stackMembers(stackID: stackID).contains { watchlistService.isWatched($0) }
+    }
+
+    /// Watches or unwatches every known part of a stack.
+    func toggleWatchForStack(_ stackID: String) {
+        let members = stackMembers(stackID: stackID)
+        let shouldWatch = !members.contains { watchlistService.isWatched($0) }
+        updateWatch(members, to: shouldWatch)
+    }
+
     func toggleWatch(for pr: PullRequest) {
         let members = stackMembers(of: pr)
         let shouldWatch = !watchlistService.isWatched(pr)
+        updateWatch(members, to: shouldWatch)
+    }
 
+    private func updateWatch(_ members: [PullRequest], to shouldWatch: Bool) {
         for member in members {
             if shouldWatch {
                 watchlistService.watch(member)
@@ -474,8 +516,12 @@ class PRMonitorViewModel: ObservableObject {
 
     private func stackMembers(of pr: PullRequest) -> [PullRequest] {
         guard let stackID = pr.stack?.id else { return [pr] }
-        let members = (unsortedPullRequests + otherPullRequests).filter { $0.stack?.id == stackID }
+        let members = stackMembers(stackID: stackID)
         return members.isEmpty ? [pr] : members
+    }
+
+    private func stackMembers(stackID: String) -> [PullRequest] {
+        (unsortedPullRequests + otherPullRequests).filter { $0.stack?.id == stackID }
     }
 
     private func setWatched(_ prID: String, _ isWatched: Bool) {

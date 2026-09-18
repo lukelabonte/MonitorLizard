@@ -798,7 +798,7 @@ struct PRMonitorViewModelTests {
     // MARK: - Stacked PRs
 
     @Test
-    func sectionItemsGroupStackedPRsWithNewestPartOnTop() {
+    func sectionRowsRenderAStackAsOneBlock() {
         let vm = makeVM()
 
         var basePR = makePR(number: 1, nameWithOwner: "acme/widget")
@@ -808,11 +808,52 @@ struct PRMonitorViewModelTests {
 
         vm.otherPullRequests = [basePR, topPR]
 
-        let items = vm.sectionItems(for: .other)
+        let rows = vm.sectionRows(for: .other)
 
-        #expect(items.map(\.pr.number) == [2, 1])
-        #expect(items.map(\.indentLevel) == [1, 0])
-        #expect(vm.filteredOtherPRs.map(\.number) == [2, 1])
+        #expect(rows.count == 3)
+        guard case .stackHeader(let header) = rows.first else {
+            Issue.record("Expected a stack header first")
+            return
+        }
+        #expect(header.number == 3)
+        #expect(rows.compactMap(\.pr).map(\.number) == [1, 2])
+        #expect(vm.filteredOtherPRs.map(\.number) == [1, 2])
+    }
+
+    @Test
+    func stackPartsAreInMergeOrder() {
+        let vm = makeVM()
+
+        var part2 = makePR(number: 2, nameWithOwner: "acme/widget")
+        part2.stack = PRStackInfo(id: "ST_stack", number: 3, size: 2, position: 2)
+        var part1 = makePR(number: 1, nameWithOwner: "acme/widget")
+        part1.stack = PRStackInfo(id: "ST_stack", number: 3, size: 2, position: 1)
+
+        vm.otherPullRequests = [part2, part1]
+
+        #expect(vm.stackParts(inStack: "ST_stack").map(\.number) == [1, 2])
+        #expect(vm.stackParts(inStack: "unknown").isEmpty)
+    }
+
+    @Test
+    func collapsingAStackHidesItsPartsWithoutChangingCounts() {
+        let vm = makeVM()
+
+        var basePR = makePR(number: 1, nameWithOwner: "acme/widget")
+        basePR.stack = PRStackInfo(id: "ST_stack", number: 3, size: 2, position: 1)
+        var topPR = makePR(number: 2, nameWithOwner: "acme/widget")
+        topPR.stack = PRStackInfo(id: "ST_stack", number: 3, size: 2, position: 2)
+
+        vm.otherPullRequests = [basePR, topPR]
+
+        vm.toggleStackCollapse("ST_stack")
+        #expect(vm.isStackCollapsed("ST_stack"))
+        #expect(vm.sectionRows(for: .other).count == 1)
+        #expect(vm.filteredOtherPRs.map(\.number) == [1, 2], "Collapsing must not change counts")
+
+        vm.toggleStackCollapse("ST_stack")
+        #expect(!vm.isStackCollapsed("ST_stack"))
+        #expect(vm.sectionRows(for: .other).count == 3)
     }
 
     @Test
@@ -879,7 +920,10 @@ struct PRMonitorViewModelTests {
             $0.otherPRsService = OtherPRsService()
             $0.customNamesService = CustomNamesService()
             $0.cacheService = PRCacheService()
-            $0[GitHubServiceKey.self] = GitHubService()
+            // Stub the service so the poll started by init cannot reach the
+            // unimplemented shell executor; its recorded issue would be attributed
+            // to whichever test is running when that task fires.
+            $0[GitHubServiceKey.self] = StubGitHubService()
         } operation: {
             let vm = PRMonitorViewModel(isDemoMode: false)
             vm.stopPolling()

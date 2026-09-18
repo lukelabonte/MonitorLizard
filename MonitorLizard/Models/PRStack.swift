@@ -29,6 +29,64 @@ struct PRStackInfo: Hashable, Codable {
     }
 }
 
+/// One part of a stack that is visible in a section.
+struct PRStackPart: Hashable {
+    let position: Int
+    let number: Int
+}
+
+/// The row that introduces a stack block: identity and state for the whole stack,
+/// so the information is not repeated on every part row.
+struct PRStackHeader: Hashable, Identifiable {
+    let stackID: String
+    let number: Int
+    let size: Int
+
+    /// The stack's parts that are visible in this section, ascending by position.
+    let visibleParts: [PRStackPart]
+
+    let readiness: PRStackReadiness
+
+    /// True when any visible part has status checks, so the stack can be watched.
+    let hasStatusChecks: Bool
+
+    var id: String { "stack-\(stackID)" }
+
+    /// The part closest to the base branch, when it is visible.
+    var basePart: PRStackPart? {
+        visibleParts.first { $0.position == 1 }
+    }
+
+    /// One-line state summary shown next to the stack number.
+    var summary: String {
+        switch readiness.status {
+        case .allReady:
+            return "All \(size) parts are ready to merge"
+        case .readyToAdvance:
+            if let basePart {
+                return "Ready to merge — start with #\(basePart.number)"
+            }
+            return "Ready to merge"
+        case .blocked(let blocker):
+            return "Blocked by part \(blocker.position) (#\(blocker.number)) — \(blocker.reason)"
+        case .unknown:
+            return "\(visibleParts.count) of \(size) parts in your lists"
+        }
+    }
+
+    /// Tooltip listing the parts the app can see.
+    var helpText: String {
+        let parts = visibleParts
+            .map { "#\($0.number) (\($0.position)/\(size))" }
+            .joined(separator: ", ")
+        var text = "Stack #\(number) — \(size) parts. Visible here: \(parts)."
+        if let readinessText = readiness.helpText {
+            text += " \(readinessText)"
+        }
+        return text
+    }
+}
+
 /// Identifies a stack that has become ready to merge, with enough context for a
 /// notification.
 struct ReadyStack: Hashable {
@@ -73,8 +131,8 @@ struct PRStackReadiness: Hashable {
         }
     }
 
-    /// One-line explanation for the stack chip's tooltip, or nil when the stack's
-    /// state cannot be judged.
+    /// One-line explanation for tooltips, or nil when the stack's state cannot be
+    /// judged.
     var helpText: String? {
         switch status {
         case .allReady:
@@ -89,33 +147,43 @@ struct PRStackReadiness: Hashable {
     }
 }
 
-/// A pull request as it should appear in a section of the menu, together with the
-/// indentation that shows where it sits in its stack.
-struct PRListItem: Identifiable, Hashable {
-    let pr: PullRequest
+/// A row in a section: a stack block's header, or a PR.
+enum PRListRow: Identifiable, Hashable {
+    case stackHeader(PRStackHeader)
+    case pr(PullRequest, StackRowContext?)
 
-    /// 0 for an unstacked PR or the part closest to the base branch, increasing
-    /// toward the top of the stack. This matches GitHub's stack popover, which puts
-    /// the base at the bottom and the newest part at the top.
-    let indentLevel: Int
+    /// Where a PR sits when it is rendered as a part inside a stack block.
+    struct StackRowContext: Hashable {
+        let position: Int
+        let size: Int
+        /// True when this part is the one everything above it is waiting on.
+        let isBlocking: Bool
+        let helpText: String
+    }
 
-    /// Readiness of the PR's stack, or nil when the PR is not stacked.
-    let stackReadiness: PRStackReadiness?
+    var id: String {
+        switch self {
+        case .stackHeader(let header): return header.id
+        case .pr(let pr, _): return pr.id
+        }
+    }
 
-    var id: String { pr.id }
+    /// The PR this row shows, or nil for a stack header.
+    var pr: PullRequest? {
+        guard case .pr(let pr, _) = self else { return nil }
+        return pr
+    }
 }
 
 enum PRStackOrdering {
-    /// Groups PRs that belong to the same stack so they render next to each other
-    /// with the newest part on top, matching GitHub's stack popover: the part
-    /// closest to the base branch sits at the bottom with no indentation and each
-    /// part above it is indented one step further.
+    /// Rows for a section: PRs without a stack stay as they are, and each stack
+    /// becomes one block — a header followed by its visible parts in merge order,
+    /// part 1 (the one closest to the base branch) first.
     ///
-    /// A stack is emitted where its first member appears in `prs`; PRs that are not
-    /// part of a stack keep their existing relative order. Only members visible in
-    /// `prs` participate, so a partially visible stack still renders in order (its
-    /// labels carry the true position within the whole stack).
-    static func items(from prs: [PullRequest]) -> [PRListItem] {
+    /// A block is emitted where its first member appears in `prs`, so a stack does
+    /// not move around while the rest of the list changes. Collapsed stacks emit
+    /// only their header.
+    static func rows(from prs: [PullRequest], collapsedStackIDs: Set<String> = []) -> [PRListRow] {
         var membersByStack: [String: [PullRequest]] = [:]
         for pr in prs {
             guard let stack = pr.stack else { continue }
@@ -123,31 +191,57 @@ enum PRStackOrdering {
         }
 
         var emittedStacks: Set<String> = []
-        var items: [PRListItem] = []
+        var rows: [PRListRow] = []
 
         for pr in prs {
             guard let stack = pr.stack,
-                  let members = membersByStack[stack.id],
-                  members.count > 1 else {
-                items.append(PRListItem(pr: pr, indentLevel: 0, stackReadiness: readiness(for: pr)))
+                  let members = membersByStack[stack.id] else {
+                rows.append(.pr(pr, nil))
                 continue
             }
             guard emittedStacks.insert(stack.id).inserted else { continue }
 
-            let stackReadiness = readiness(of: members, stackSize: stack.size)
+            let readiness = readiness(of: members, stackSize: stack.size)
+            let visibleParts = members
+                .compactMap { member -> PRStackPart? in
+                    guard let memberStack = member.stack else { return nil }
+                    return PRStackPart(position: memberStack.position, number: member.number)
+                }
+                .sorted { $0.position < $1.position }
+
+            rows.append(.stackHeader(PRStackHeader(
+                stackID: stack.id,
+                number: stack.number,
+                size: stack.size,
+                visibleParts: visibleParts,
+                readiness: readiness,
+                hasStatusChecks: members.contains { $0.hasStatusChecks }
+            )))
+
+            guard !collapsedStackIDs.contains(stack.id) else { continue }
+
             let ordered = members.sorted {
-                ($0.stack?.position ?? 0) > ($1.stack?.position ?? 0)
+                ($0.stack?.position ?? 0) < ($1.stack?.position ?? 0)
             }
-            for (index, member) in ordered.enumerated() {
-                items.append(PRListItem(
-                    pr: member,
-                    indentLevel: ordered.count - 1 - index,
-                    stackReadiness: stackReadiness
-                ))
+            for member in ordered {
+                guard let memberStack = member.stack else { continue }
+                var isBlocking = false
+                if case .blocked(let blocker) = readiness.status, blocker.number == member.number {
+                    isBlocking = true
+                }
+                let helpText = [memberStack.helpText, readiness.helpText]
+                    .compactMap { $0 }
+                    .joined(separator: " ")
+                rows.append(.pr(member, PRListRow.StackRowContext(
+                    position: memberStack.position,
+                    size: memberStack.size,
+                    isBlocking: isBlocking,
+                    helpText: helpText
+                )))
             }
         }
 
-        return items
+        return rows
     }
 
     /// Readiness of a stack from the parts the app can see.
@@ -173,11 +267,6 @@ enum PRStackOrdering {
         }
         let status: PRStackReadiness.Status = ordered.count == stackSize ? .allReady : .readyToAdvance
         return PRStackReadiness(status: status, size: stackSize)
-    }
-
-    private static func readiness(for pr: PullRequest) -> PRStackReadiness? {
-        guard let stack = pr.stack else { return nil }
-        return readiness(of: [pr], stackSize: stack.size)
     }
 
     /// Stacks whose lowest part has just become ready to merge.

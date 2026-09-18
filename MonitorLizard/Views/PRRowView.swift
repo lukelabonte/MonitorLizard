@@ -46,16 +46,22 @@ extension PRStackReadiness {
 }
 
 struct PRRowView: View {
-    let item: PRListItem
+    let pr: PullRequest
+
+    /// Where this PR sits in its stack, when it renders as a part inside a stack
+    /// block. Stack parts use a one-line layout so long stacks stay scannable.
+    let stackContext: PRListRow.StackRowContext?
+
     @EnvironmentObject var viewModel: PRMonitorViewModel
     @Environment(\.scrollViewHovered) private var scrollViewHovered
 
     @State private var isHovering = false
 
-    private var pr: PullRequest { item.pr }
+    private var isStackPart: Bool { stackContext != nil }
 
-    private var leadingPadding: CGFloat {
-        12 + CGFloat(item.indentLevel) * 14
+    init(pr: PullRequest, stackContext: PRListRow.StackRowContext? = nil) {
+        self.pr = pr
+        self.stackContext = stackContext
     }
 
     nonisolated static func daysSinceUpdate(from date: Date, now: Date = Date(), calendar: Calendar = .current) -> Int {
@@ -90,11 +96,6 @@ struct PRRowView: View {
         } else {
             return "updated \(daysSinceUpdate) days ago"
         }
-    }
-
-    private func stackHelpText(_ stack: PRStackInfo) -> String {
-        guard let readinessText = item.stackReadiness?.helpText else { return stack.helpText }
-        return "\(stack.helpText) \(readinessText)"
     }
 
     private var watchHelpText: String {
@@ -210,6 +211,139 @@ struct PRRowView: View {
     }
 
     var body: some View {
+        Group {
+            if let stackContext {
+                compactBody(stackContext)
+            } else {
+                fullBody
+            }
+        }
+        .padding(.leading, isStackPart ? 36 : 12)
+        .padding(.trailing, 12)
+        .padding(.vertical, isStackPart ? 6 : 10)
+        .background(isHovering ? Color.gray.opacity(0.1) : Color.clear)
+        .contentShape(Rectangle())
+        // Use onContinuousHover instead of onHover to avoid an infinite
+        // SwiftUI update loop. During scrolling, LazyVStack recycles views,
+        // which can rapid-fire .onHover events. Each event sets @State,
+        // triggering a view update that causes more recycling and more hover
+        // events, freezing the app in AG::Graph::UpdateStack::update.
+        // The guards prevent redundant state writes from triggering updates.
+        .onContinuousHover { phase in
+            switch phase {
+            case .active:
+                if !isHovering { isHovering = true }
+            case .ended:
+                if isHovering { isHovering = false }
+            }
+        }
+        .onChange(of: scrollViewHovered) {
+            if !scrollViewHovered && isHovering { isHovering = false }
+        }
+        .onTapGesture {
+            openPRURL()
+        }
+    }
+
+    /// Two compact lines per stack part: position, number, title, and state, then the
+    /// branch and labels. The stack's identity and blocking state live in the block
+    /// header instead of on every row.
+    private func compactBody(_ context: PRListRow.StackRowContext) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                if context.isBlocking {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                        .help("Blocks the rest of the stack from advancing")
+                }
+
+                Text("\(context.position)")
+                    .font(.caption2)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.secondary)
+                    .frame(width: 16, height: 16)
+                    .background(Circle().fill(Color.secondary.opacity(0.15)))
+                    .help("Part \(context.position) of \(context.size)")
+
+                Text("#\(pr.number, format: .number.grouping(.never))")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Text(pr.displayTitle)
+                    .font(.subheadline)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                if pr.isDraft {
+                    Text("DRAFT")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.orange.opacity(0.8))
+                        .cornerRadius(3)
+                }
+
+                Spacer(minLength: 4)
+
+                HStack(spacing: 4) {
+                    compactStatusIcon
+                    Text(pr.buildStatus.displayName)
+                        .font(.caption)
+                        .foregroundColor(pr.buildStatus.color)
+                }
+            }
+
+            if !pr.headRefName.isEmpty || !pr.labels.isEmpty {
+                HStack(spacing: 6) {
+                    if !pr.headRefName.isEmpty {
+                        Image(systemName: "arrow.branch")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary)
+
+                        Text(pr.headRefName)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    ForEach(pr.labels) { label in
+                        let bgColor = Color(hex: label.color)
+                        Text(label.name)
+                            .font(.system(size: 9))
+                            .foregroundColor(bgColor.contrastingTextColor)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(bgColor)
+                            .cornerRadius(3)
+                    }
+                }
+            }
+        }
+        .help(context.helpText)
+        .accessibilityLabel("Stack part \(context.position) of \(context.size), PR \(pr.number), \(pr.buildStatus.displayName)")
+    }
+
+    private var compactStatusIcon: some View {
+        Group {
+            if pr.buildStatus == .pending {
+                Image(systemName: "gear")
+                    .font(.system(size: 10))
+                    .foregroundColor(.gray)
+            } else if let systemImageName = pr.buildStatus.systemImageName {
+                Image(systemName: systemImageName)
+                    .font(.system(size: 10))
+                    .foregroundColor(pr.buildStatus.color)
+            } else {
+                Text(pr.buildStatus.icon)
+                    .font(.system(size: 10))
+            }
+        }
+    }
+
+    private var fullBody: some View {
         HStack(spacing: 12) {
             statusIconsColumn
 
@@ -246,43 +380,6 @@ struct PRRowView: View {
                             .cornerRadius(3)
                     }
 
-                    // Stack position badge
-                    if let stack = pr.stack {
-                        let tint = item.stackReadiness?.color ?? .secondary
-                        HStack(spacing: 3) {
-                            Image(systemName: "square.stack.3d.up")
-                                .font(.system(size: 9))
-                            Text(stack.positionLabel)
-                                .font(.caption2)
-                                .fontWeight(.medium)
-                        }
-                        .foregroundColor(tint)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(tint.opacity(0.15))
-                        .cornerRadius(3)
-                        .help(stackHelpText(stack))
-                        .accessibilityLabel("Stack part \(stack.position) of \(stack.size)")
-
-                        // Marks the part every later part is waiting on
-                        if case .blocked(let blocker) = item.stackReadiness?.status,
-                           blocker.number == pr.number {
-                            HStack(spacing: 3) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .font(.system(size: 9))
-                                Text("blocking")
-                                    .font(.caption2)
-                                    .fontWeight(.medium)
-                            }
-                            .foregroundColor(.orange)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(Color.orange.opacity(0.15))
-                            .cornerRadius(3)
-                            .help("Blocks the rest of stack #\(stack.number) from advancing (\(blocker.reason)).")
-                            .accessibilityLabel("Blocking the stack: \(blocker.reason)")
-                        }
-                    }
                 }
 
                 // Branch name
@@ -482,31 +579,6 @@ struct PRRowView: View {
                 Spacer(minLength: 0)
             }
             .frame(width: 64, alignment: .trailing) // Fixed width: fits 3-icon row (Other PRs)
-        }
-        .padding(.leading, leadingPadding)
-        .padding(.trailing, 12)
-        .padding(.vertical, 10)
-        .background(isHovering ? Color.gray.opacity(0.1) : Color.clear)
-        .contentShape(Rectangle())
-        // Use onContinuousHover instead of onHover to avoid an infinite
-        // SwiftUI update loop. During scrolling, LazyVStack recycles views,
-        // which can rapid-fire .onHover events. Each event sets @State,
-        // triggering a view update that causes more recycling and more hover
-        // events, freezing the app in AG::Graph::UpdateStack::update.
-        // The guards prevent redundant state writes from triggering updates.
-        .onContinuousHover { phase in
-            switch phase {
-            case .active:
-                if !isHovering { isHovering = true }
-            case .ended:
-                if isHovering { isHovering = false }
-            }
-        }
-        .onChange(of: scrollViewHovered) {
-            if !scrollViewHovered && isHovering { isHovering = false }
-        }
-        .onTapGesture {
-            openPRURL()
         }
     }
 }

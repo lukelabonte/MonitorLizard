@@ -54,67 +54,139 @@ struct PRStackOrderingTests {
         )
     }
 
-    @Test func putsNewestStackPartOnTopWithBaseAtTheBottom() {
-        let items = PRStackOrdering.items(from: [
+    private func header(_ rows: [PRListRow]) -> PRStackHeader? {
+        guard case .stackHeader(let header) = rows.first else { return nil }
+        return header
+    }
+
+    private func positions(_ rows: [PRListRow]) -> [Int] {
+        rows.compactMap { $0.pr?.stack?.position }
+    }
+
+    @Test func rendersAStackAsOneBlockInMergeOrder() {
+        let rows = PRStackOrdering.rows(from: [
             makePR(1, position: 1),
             makePR(3, position: 3),
             makePR(2, position: 2),
             makePR(4, position: 4),
         ])
 
-        #expect(items.map(\.pr.number) == [4, 3, 2, 1])
-        #expect(items.map(\.indentLevel) == [3, 2, 1, 0])
+        #expect(rows.count == 5)
+        let header = header(rows)
+        #expect(header?.number == 7)
+        #expect(header?.size == 4)
+        #expect(header?.visibleParts.map(\.number) == [1, 2, 3, 4])
+        #expect(rows.compactMap(\.pr).map(\.number) == [1, 2, 3, 4])
+        #expect(positions(rows) == [1, 2, 3, 4])
     }
 
-    @Test func leavesUnstackedPRsInPlace() {
-        let items = PRStackOrdering.items(from: [makeUnstackedPR(10), makeUnstackedPR(11)])
+    @Test func leavesUnstackedPRsAsPlainRows() {
+        let rows = PRStackOrdering.rows(from: [makeUnstackedPR(10), makeUnstackedPR(11)])
 
-        #expect(items.map(\.pr.number) == [10, 11])
-        #expect(items.map(\.indentLevel) == [0, 0])
+        #expect(rows.count == 2)
+        #expect(rows.compactMap(\.pr).map(\.number) == [10, 11])
+        for row in rows {
+            guard case .pr(_, let context) = row else {
+                Issue.record("Expected a plain PR row")
+                continue
+            }
+            #expect(context == nil)
+        }
     }
 
-    @Test func keepsStackMembersAdjacentWhenOtherPRsSeparateThem() {
-        let items = PRStackOrdering.items(from: [
+    @Test func keepsAStackTogetherWhenOtherPRsSeparateThem() {
+        let rows = PRStackOrdering.rows(from: [
             makeUnstackedPR(10),
             makePR(2, stackSize: 2, position: 2),
             makeUnstackedPR(11),
             makePR(1, stackSize: 2, position: 1),
         ])
 
-        #expect(items.map(\.pr.number) == [10, 2, 1, 11])
-        #expect(items.map(\.indentLevel) == [0, 1, 0, 0])
+        #expect(rows.compactMap(\.pr).map(\.number) == [10, 1, 2, 11])
+        guard case .stackHeader = rows[1] else {
+            Issue.record("Expected the stack header at index 1")
+            return
+        }
     }
 
-    @Test func groupsMembersOfDifferentStacksSeparately() {
-        let items = PRStackOrdering.items(from: [
+    @Test func rendersEachStackAsItsOwnBlock() {
+        let rows = PRStackOrdering.rows(from: [
             makePR(1, stackID: "a", stackSize: 2, position: 1),
             makePR(3, stackID: "b", stackSize: 2, position: 1),
             makePR(2, stackID: "a", stackSize: 2, position: 2),
             makePR(4, stackID: "b", stackSize: 2, position: 2),
         ])
 
-        #expect(items.map(\.pr.number) == [2, 1, 4, 3])
-        #expect(items.map(\.indentLevel) == [1, 0, 1, 0])
+        #expect(rows.compactMap(\.pr).map(\.number) == [1, 2, 3, 4])
+        let headerCount = rows.filter { row in
+            if case .stackHeader = row { return true }
+            return false
+        }.count
+        #expect(headerCount == 2)
     }
 
-    @Test func partialStackKeepsTruePositionLabels() {
-        // Only positions 3 and 4 of a four-PR stack are visible. Indentation is
-        // relative to the visible group; the labels carry the real position.
-        let items = PRStackOrdering.items(from: [
+    @Test func partialStackReportsOnlyTheVisibleParts() {
+        // Only positions 3 and 4 of a four-PR stack are visible.
+        let rows = PRStackOrdering.rows(from: [
             makePR(3, position: 3),
             makePR(4, position: 4),
         ])
 
-        #expect(items.map(\.pr.number) == [4, 3])
-        #expect(items.map(\.indentLevel) == [1, 0])
-        #expect(items.map { $0.pr.stack?.positionLabel } == ["4/4", "3/4"])
+        #expect(rows.compactMap(\.pr).map(\.number) == [3, 4])
+        let header = header(rows)
+        #expect(header?.visibleParts.map(\.position) == [3, 4])
+        #expect(header?.summary == "2 of 4 parts in your lists")
     }
 
-    @Test func singleVisibleStackMemberIsNotIndented() {
-        let items = PRStackOrdering.items(from: [makePR(2, position: 2)])
+    @Test func singleVisibleStackMemberStillGetsABlock() {
+        let rows = PRStackOrdering.rows(from: [makePR(2, position: 2)])
 
-        #expect(items.map(\.indentLevel) == [0])
-        #expect(items.first?.pr.stack?.positionLabel == "2/4")
+        #expect(rows.count == 2)
+        #expect(header(rows)?.visibleParts.map(\.position) == [2])
+        guard case .pr(_, let context) = rows[1] else {
+            Issue.record("Expected the part row")
+            return
+        }
+        #expect(context?.position == 2)
+        #expect(context?.size == 4)
+    }
+
+    @Test func collapsedStackEmitsOnlyItsHeader() {
+        let prs = [makePR(1, position: 1), makePR(2, position: 2)]
+
+        let rows = PRStackOrdering.rows(from: prs, collapsedStackIDs: ["stack-1"])
+
+        #expect(rows.count == 1)
+        #expect(header(rows)?.size == 4)
+    }
+
+    @Test func marksOnlyTheBlockingPart() {
+        let rows = PRStackOrdering.rows(from: [
+            makePR(1, position: 1, status: .failure),
+            makePR(2, position: 2),
+        ])
+
+        for row in rows {
+            guard case .pr(let pr, let context) = row else { continue }
+            #expect(context?.isBlocking == (pr.number == 1))
+        }
+    }
+
+    @Test func headerSummarizesTheStackState() {
+        let blocked = header(PRStackOrdering.rows(from: [
+            makePR(1, position: 1, status: .pending),
+            makePR(2, position: 2),
+        ]))
+        #expect(blocked?.summary == "Blocked by part 1 (#1) — checks pending")
+
+        let ready = header(PRStackOrdering.rows(from: [
+            makePR(1, stackSize: 2, position: 1),
+            makePR(2, stackSize: 2, position: 2),
+        ]))
+        #expect(ready?.summary == "All 2 parts are ready to merge")
+
+        let waiting = header(PRStackOrdering.rows(from: [makePR(1, position: 1)]))
+        #expect(waiting?.summary == "Ready to merge — start with #1")
     }
 }
 
