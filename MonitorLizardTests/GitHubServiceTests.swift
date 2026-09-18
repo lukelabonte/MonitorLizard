@@ -1204,4 +1204,61 @@ struct GitHubServiceBatchIntegrationTests {
         #expect(buildCheck.isNonBlocking == false)
         #expect(pr.nonBlockingCheckSummary == nil)
     }
+
+    // MARK: - Viewer approval mapping
+
+    private static let viewerApprovedBatchStatusResult = """
+    {
+      "data": {
+        "viewer": { "login": "luke" },
+        "pr0": {
+          "pullRequest": {
+            "headRefName": "feature/test",
+            "statusCheckRollup": null,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "reviewDecision": null,
+            "latestReviews": { "nodes": [{ "state": "COMMENTED", "author": { "login": "luke" } }] },
+            "latestOpinionatedReviews": { "nodes": [{ "state": "APPROVED", "author": { "login": "luke" } }] },
+            "reviewRequests": { "nodes": [] }
+          }
+        }
+      }
+    }
+    """
+
+    @Test func fetchAllOpenPRsMapsViewerApprovalOntoPullRequest() async throws {
+        // The viewer commented after approving; `latestReviews` alone would mask the
+        // approval, so only `latestOpinionatedReviews` can establish it.
+        let mock = MockShellExecutor(
+            executeResponseMatchers: [
+                ("--author=@me", .success(Self.authoredSearchResult)),
+                ("graphql", .success(Self.viewerApprovedBatchStatusResult))
+            ]
+        )
+        let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }
+
+        let result = try await service.fetchAllOpenPRs(enableInactiveDetection: false, inactiveThresholdDays: 3)
+        let pr = try #require(result.pullRequests.first)
+
+        #expect(pr.viewerApproved == true)
+        #expect(pr.isApprovedByViewer == true)
+    }
+
+    @Test func fetchAllOpenPRsLeavesViewerApprovalNilWhenResponseHasNoViewerData() async throws {
+        // batchStatusResult has no top-level viewer and no opinionated reviews.
+        let mock = MockShellExecutor(
+            executeResponseMatchers: [
+                ("--author=@me", .success(Self.authoredSearchResult)),
+                ("graphql", .success(Self.batchStatusResult))
+            ]
+        )
+        let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }
+
+        let result = try await service.fetchAllOpenPRs(enableInactiveDetection: false, inactiveThresholdDays: 3)
+        let pr = try #require(result.pullRequests.first)
+
+        #expect(pr.viewerApproved == nil)
+        #expect(pr.isApprovedByViewer == false)
+    }
 }

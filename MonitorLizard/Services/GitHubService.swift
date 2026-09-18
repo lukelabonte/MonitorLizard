@@ -195,6 +195,12 @@ class GitHubService: GitHubServicing, ObservableObject {
                     author { login }
                   }
                 }
+                latestOpinionatedReviews(last: 20) {
+                  nodes {
+                    state
+                    author { login }
+                  }
+                }
                 reviewRequests(last: 20) {
                   nodes {
                     requestedReviewer {
@@ -208,7 +214,7 @@ class GitHubService: GitHubServicing, ObservableObject {
             """.replacingOccurrences(of: stackEntryPlaceholder, with: stackEntry)
         }
 
-        return "query {\n\(fragments.joined(separator: "\n"))}"
+        return "query {\n\(fragments.joined(separator: "\n"))\nviewer { login }\n}"
     }
 
     nonisolated static func buildPRDetailQuery(for request: PRStatusRequest, includeStackInfo: Bool = true) -> String {
@@ -271,6 +277,12 @@ class GitHubService: GitHubServicing, ObservableObject {
                   author { login }
                 }
               }
+              latestOpinionatedReviews(last: 20) {
+                nodes {
+                  state
+                  author { login }
+                }
+              }
               reviewRequests(last: 20) {
                 nodes {
                   requestedReviewer {
@@ -281,6 +293,7 @@ class GitHubService: GitHubServicing, ObservableObject {
                 \(stackEntryPlaceholder)
             }
           }
+          viewer { login }
         }
         """.replacingOccurrences(of: stackEntryPlaceholder, with: stackEntry)
     }
@@ -323,7 +336,7 @@ class GitHubService: GitHubServicing, ObservableObject {
         for (index, request) in requests.enumerated() {
             if let prNode = response.data["pr\(index)"],
                let prStatus = prNode.pullRequest {
-                result[request] = prStatus.toDetailResponse()
+                result[request] = prStatus.toDetailResponse(viewerLogin: response.data.viewerLogin)
             }
         }
         return result
@@ -594,7 +607,8 @@ class GitHubService: GitHubServicing, ObservableObject {
                     reviewRequests: detail?.reviewRequests
                 ),
                 host: host,
-                stack: detail?.stack
+                stack: detail?.stack,
+                viewerApproved: detail?.viewerApproved
             )
         }
     }
@@ -1070,11 +1084,12 @@ class GitHubService: GitHubServicing, ObservableObject {
     /// distinguish "permanently gone" from "temporarily unavailable".
     func fetchOtherPR(_ id: OtherPRIdentifier, enableInactiveDetection: Bool, inactiveThresholdDays: Int) async throws -> PullRequest? {
         let request = PRStatusRequest(owner: id.owner, repo: id.repo, number: id.number)
-        guard let response = try await fetchPRDetail(for: request, host: id.host) else {
+        guard let detail = try await fetchPRDetail(for: request, host: id.host) else {
             return nil
         }
         return try buildPullRequest(
-            from: response,
+            from: detail.response,
+            viewerLogin: detail.viewerLogin,
             owner: id.owner,
             repo: id.repo,
             type: .other,
@@ -1127,7 +1142,8 @@ class GitHubService: GitHubServicing, ObservableObject {
             let request = PRStatusRequest(owner: owner, repo: repo, number: entryPR.number)
             guard let detail = try await fetchPRDetail(for: request, host: host),
                   let part = try buildPullRequest(
-                      from: detail,
+                      from: detail.response,
+                      viewerLogin: detail.viewerLogin,
                       owner: owner,
                       repo: repo,
                       type: type,
@@ -1145,6 +1161,7 @@ class GitHubService: GitHubServicing, ObservableObject {
     /// PRs list and by stack parts fetched to complete a stack.
     private func buildPullRequest(
         from response: BatchPRStatusResponse,
+        viewerLogin: String?,
         owner: String,
         repo: String,
         type: PRType,
@@ -1208,11 +1225,12 @@ class GitHubService: GitHubServicing, ObservableObject {
             statusChecks: statusChecks,
             reviewDecision: reviewDecision,
             host: host,
-            stack: response.stackEntry?.stackInfo
+            stack: response.stackEntry?.stackInfo,
+            viewerApproved: response.viewerApproved(viewerLogin: viewerLogin)
         )
     }
 
-    private func fetchPRDetail(for request: PRStatusRequest, host: String) async throws -> BatchPRStatusResponse? {
+    private func fetchPRDetail(for request: PRStatusRequest, host: String) async throws -> (response: BatchPRStatusResponse, viewerLogin: String?)? {
         let json = try await executeGraphQL(host: host) { includeStackInfo in
             GitHubService.buildPRDetailQuery(for: request, includeStackInfo: includeStackInfo)
         }
@@ -1221,7 +1239,11 @@ class GitHubService: GitHubServicing, ObservableObject {
             throw GitHubError.invalidResponse
         }
         let response = try JSONDecoder().decode(BatchGraphQLResponse.self, from: data)
-        return response.data["pr0"]?.pullRequest
+        guard let prNode = response.data["pr0"],
+              let pullRequest = prNode.pullRequest else {
+            return nil
+        }
+        return (response: pullRequest, viewerLogin: response.data.viewerLogin)
     }
 
     private func extractOwner(from nameWithOwner: String) -> String {

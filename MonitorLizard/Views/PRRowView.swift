@@ -74,6 +74,23 @@ struct PRRowView: View {
         PRRowView.daysSinceUpdate(from: pr.updatedAt)
     }
 
+    /// Dimming for text content of stack parts the viewer already approved, so
+    /// unreviewed parts stand out. Badges and status icons stay full-color.
+    private var approvedRowTextOpacity: Double {
+        pr.isApprovedByViewer ? 0.55 : 1
+    }
+
+    /// Green seal marking PRs the authenticated viewer has already approved.
+    /// Icon-only so it never pushes the row's text into wrapping; the caller
+    /// picks the font size to fit its layout.
+    private func viewerApprovedSeal(font: Font, help: String) -> some View {
+        Image(systemName: "checkmark.seal.fill")
+            .font(font)
+            .foregroundColor(.green)
+            .fixedSize()
+            .help(help)
+    }
+
     private func openPRURL() {
         // Close the menu bar extra by ordering out all panels
         NSApp.windows.forEach { window in
@@ -216,13 +233,6 @@ struct PRRowView: View {
     private func compactBody(_ context: PRListRow.StackRowContext) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 8) {
-                if context.isBlocking {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 10))
-                        .foregroundColor(.orange)
-                        .help("Blocks the rest of the stack from advancing")
-                }
-
                 Text("\(context.position)")
                     .font(.caption2)
                     .fontWeight(.semibold)
@@ -230,6 +240,17 @@ struct PRRowView: View {
                     .frame(width: 16, height: 16)
                     .background(Circle().fill(Color.secondary.opacity(0.15)))
                     .help("Part \(context.position) of \(context.size)")
+
+                if pr.isApprovedByViewer {
+                    viewerApprovedSeal(font: .system(size: 10), help: "You approved this part")
+                }
+
+                if context.isBlocking {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                        .help("Blocks the rest of the stack from advancing")
+                }
 
                 Text("#\(pr.number, format: .number.grouping(.never))")
                     .font(.caption)
@@ -239,6 +260,7 @@ struct PRRowView: View {
                     .font(.subheadline)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                    .opacity(approvedRowTextOpacity)
 
                 if pr.isDraft {
                     Text("DRAFT")
@@ -257,6 +279,7 @@ struct PRRowView: View {
                     Text(pr.buildStatus.displayName)
                         .font(.caption)
                         .foregroundColor(pr.buildStatus.color)
+                        .opacity(approvedRowTextOpacity)
                 }
             }
 
@@ -266,12 +289,14 @@ struct PRRowView: View {
                         Image(systemName: "arrow.branch")
                             .font(.system(size: 9))
                             .foregroundColor(.secondary)
+                            .opacity(approvedRowTextOpacity)
 
                         Text(pr.headRefName)
                             .font(.caption2)
                             .foregroundColor(.secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
+                            .opacity(approvedRowTextOpacity)
                     }
 
                     ForEach(pr.labels) { label in
@@ -283,12 +308,13 @@ struct PRRowView: View {
                             .padding(.vertical, 1)
                             .background(bgColor)
                             .cornerRadius(3)
+                            .opacity(approvedRowTextOpacity)
                     }
                 }
             }
         }
         .help(context.helpText)
-        .accessibilityLabel("Stack part \(context.position) of \(context.size), PR \(pr.number), \(pr.buildStatus.displayName)")
+        .accessibilityLabel("Stack part \(context.position) of \(context.size), PR \(pr.number), \(pr.buildStatus.displayName)\(pr.isApprovedByViewer ? ", approved by you" : "")")
     }
 
     private var compactStatusIcon: some View {
@@ -314,10 +340,16 @@ struct PRRowView: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 // PR Title
-                Text(pr.displayTitle)
-                    .font(.body)
-                    .lineLimit(3)
-                    .fixedSize(horizontal: false, vertical: true)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(pr.displayTitle)
+                        .font(.body)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if pr.isApprovedByViewer {
+                        viewerApprovedSeal(font: .body, help: "You approved this PR")
+                    }
+                }
 
                 // Repo and PR number
                 HStack(spacing: 4) {

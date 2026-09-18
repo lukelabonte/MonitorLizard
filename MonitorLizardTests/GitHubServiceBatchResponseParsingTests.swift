@@ -250,4 +250,127 @@ struct GitHubServiceBatchResponseParsingTests {
 
         #expect(result[request]?.requiredStatusCheckContexts == nil)
     }
+
+    // MARK: - Viewer approval
+
+    /// Builds a batch response with the given top-level `viewer` JSON (the key is
+    /// omitted entirely when nil) and a single PR carrying the given review nodes.
+    /// When `opinionatedReviewNodes` is nil the `latestOpinionatedReviews` key is
+    /// omitted from the PR object entirely.
+    private static func makeViewerResponse(
+        viewerJSON: String?,
+        latestReviewNodes: String = "",
+        opinionatedReviewNodes: String? = ""
+    ) -> String {
+        let viewerSection = viewerJSON.map { "\n      \"viewer\": \($0)," } ?? ""
+        let opinionatedSection = opinionatedReviewNodes.map { "\n                \"latestOpinionatedReviews\": { \"nodes\": [\($0)] }," } ?? ""
+        return """
+        {
+          "data": {\(viewerSection)
+            "pr0": {
+              "pullRequest": {
+                "headRefName": "feature/approval",
+                "statusCheckRollup": null,
+                "mergeable": null,
+                "mergeStateStatus": null,
+                "reviewDecision": null,
+                "latestReviews": { "nodes": [\(latestReviewNodes)] },\(opinionatedSection)
+                "reviewRequests": { "nodes": [] }
+              }
+            }
+          }
+        }
+        """
+    }
+
+    @Test func parseBatchResponseDerivesViewerApprovalFromOpinionatedReviews() throws {
+        // Regression: `latestReviews` includes comments, so a later COMMENTED entry
+        // masks the approval. The viewer's approval must come from
+        // `latestOpinionatedReviews` instead.
+        let json = Self.makeViewerResponse(
+            viewerJSON: "{ \"login\": \"luke\" }",
+            latestReviewNodes: "{ \"state\": \"COMMENTED\", \"author\": { \"login\": \"luke\" } }",
+            opinionatedReviewNodes: "{ \"state\": \"APPROVED\", \"author\": { \"login\": \"luke\" } }"
+        )
+        let request = PRStatusRequest(owner: "owner", repo: "repo", number: 1)
+
+        let result = try GitHubService.parseBatchResponse(json, requests: [request])
+
+        #expect(result[request]?.viewerApproved == true)
+    }
+
+    @Test func parseBatchResponseTreatsViewerChangesRequestedAsNotApproved() throws {
+        let json = Self.makeViewerResponse(
+            viewerJSON: "{ \"login\": \"luke\" }",
+            opinionatedReviewNodes: "{ \"state\": \"CHANGES_REQUESTED\", \"author\": { \"login\": \"luke\" } }"
+        )
+        let request = PRStatusRequest(owner: "owner", repo: "repo", number: 1)
+
+        let result = try GitHubService.parseBatchResponse(json, requests: [request])
+
+        #expect(result[request]?.viewerApproved == false)
+    }
+
+    @Test func parseBatchResponseTreatsViewerWithoutOpinionatedReviewAsNotApproved() throws {
+        let json = Self.makeViewerResponse(
+            viewerJSON: "{ \"login\": \"luke\" }",
+            opinionatedReviewNodes: "{ \"state\": \"CHANGES_REQUESTED\", \"author\": { \"login\": \"someone-else\" } }"
+        )
+        let request = PRStatusRequest(owner: "owner", repo: "repo", number: 1)
+
+        let result = try GitHubService.parseBatchResponse(json, requests: [request])
+
+        #expect(result[request]?.viewerApproved == false)
+    }
+
+    @Test func parseBatchResponseLeavesViewerApprovalNilWithoutViewerKey() throws {
+        let json = Self.makeViewerResponse(
+            viewerJSON: nil,
+            opinionatedReviewNodes: "{ \"state\": \"APPROVED\", \"author\": { \"login\": \"luke\" } }"
+        )
+        let request = PRStatusRequest(owner: "owner", repo: "repo", number: 1)
+
+        let result = try GitHubService.parseBatchResponse(json, requests: [request])
+
+        #expect(result[request]?.viewerApproved == nil)
+        #expect(result[request]?.headRefName == "feature/approval")
+    }
+
+    @Test func parseBatchResponseLeavesViewerApprovalNilWhenViewerIsNull() throws {
+        let json = Self.makeViewerResponse(
+            viewerJSON: "null",
+            opinionatedReviewNodes: "{ \"state\": \"APPROVED\", \"author\": { \"login\": \"luke\" } }"
+        )
+        let request = PRStatusRequest(owner: "owner", repo: "repo", number: 1)
+
+        let result = try GitHubService.parseBatchResponse(json, requests: [request])
+
+        #expect(result[request]?.viewerApproved == nil)
+        #expect(result[request]?.headRefName == "feature/approval")
+    }
+
+    @Test func parseBatchResponseLeavesViewerApprovalNilWhenOpinionatedReviewsAreAbsent() throws {
+        let json = Self.makeViewerResponse(
+            viewerJSON: "{ \"login\": \"luke\" }",
+            opinionatedReviewNodes: nil
+        )
+        let request = PRStatusRequest(owner: "owner", repo: "repo", number: 1)
+
+        let result = try GitHubService.parseBatchResponse(json, requests: [request])
+
+        #expect(result[request]?.viewerApproved == nil)
+        #expect(result[request]?.headRefName == "feature/approval")
+    }
+
+    @Test func parseBatchResponseDoesNotTreatOtherUsersApprovalAsViewerApproval() throws {
+        let json = Self.makeViewerResponse(
+            viewerJSON: "{ \"login\": \"luke\" }",
+            opinionatedReviewNodes: "{ \"state\": \"APPROVED\", \"author\": { \"login\": \"someone-else\" } }"
+        )
+        let request = PRStatusRequest(owner: "owner", repo: "repo", number: 1)
+
+        let result = try GitHubService.parseBatchResponse(json, requests: [request])
+
+        #expect(result[request]?.viewerApproved == false)
+    }
 }

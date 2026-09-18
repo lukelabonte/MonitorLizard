@@ -689,7 +689,9 @@ struct PRMonitorViewModelTests {
         #expect(!vm.authoredPRs.isEmpty)
         #expect(vm.authoredPRs.allSatisfy { $0.repository.nameWithOwner == "fromagerie/cheese-cellar-manager" })
 
-        #expect(vm.reviewPRs.isEmpty)
+        // The demo data also gives this repo a reviewing stack (demo-stack-camembert),
+        // so review PRs may exist here — but they must all belong to this repo.
+        #expect(vm.reviewPRs.allSatisfy { $0.repository.nameWithOwner == "fromagerie/cheese-cellar-manager" })
     }
 
     @Test

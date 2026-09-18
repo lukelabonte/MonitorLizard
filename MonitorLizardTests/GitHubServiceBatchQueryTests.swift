@@ -85,6 +85,30 @@ struct GitHubServiceBatchQueryTests {
         #expect(query.contains("pr0"))
     }
 
+    enum ViewerQueryScenario: CaseIterable, Sendable {
+        case batch
+        case detail
+
+        func query(includeStackInfo: Bool) -> String {
+            let request = PRStatusRequest(owner: "alice", repo: "repo", number: 42)
+            switch self {
+            case .batch:
+                return GitHubService.buildBatchQuery(for: [request], includeStackInfo: includeStackInfo)
+            case .detail:
+                return GitHubService.buildPRDetailQuery(for: request, includeStackInfo: includeStackInfo)
+            }
+        }
+    }
+
+    @Test(arguments: ViewerQueryScenario.allCases, [true, false])
+    func queryIncludesViewerLoginAndOpinionatedReviews(scenario: ViewerQueryScenario, includeStackInfo: Bool) {
+        let query = scenario.query(includeStackInfo: includeStackInfo)
+
+        #expect(query.range(of: #"viewer\s*\{\s*login\s*\}"#, options: .regularExpression) != nil)
+        #expect(query.contains("latestOpinionatedReviews"))
+        #expect(query.range(of: #"latestOpinionatedReviews[^{]*\{\s*nodes"#, options: .regularExpression) != nil)
+    }
+
     @Test func buildBatchQueryForEmptyListProducesValidQuery() {
         let query = GitHubService.buildBatchQuery(for: [])
         #expect(query.contains("query"))

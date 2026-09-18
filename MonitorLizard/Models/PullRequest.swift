@@ -65,8 +65,16 @@ struct PullRequest: Identifiable, Hashable, Codable {
     let host: String  // GitHub host (e.g. "github.com" or enterprise hostname)
     var customName: String?  // nil = use GitHub title
     var stack: PRStackInfo?  // nil = not part of a GitHub stack
+    /// Whether the authenticated viewer approved this PR, judged by their latest
+    /// opinionated review. true = approved, false = not approved (their latest
+    /// opinionated review says otherwise, or they have none), nil = unknown
+    /// (older cached data or a fetch that could not determine it).
+    var viewerApproved: Bool? = nil
 
     var displayTitle: String { customName ?? title }
+
+    /// True only when the viewer's approval is known and positive.
+    var isApprovedByViewer: Bool { viewerApproved == true }
 
     var id: String {
         "\(repository.nameWithOwner)#\(number)"
@@ -255,6 +263,7 @@ struct BatchPRStatusResponse: Codable {
     let mergeStateStatus: String?
     let reviewDecision: String?
     let latestReviews: ReviewConnection?
+    let latestOpinionatedReviews: ReviewConnection?
     let reviewRequests: ReviewRequestConnection?
     let baseRef: BaseRef?
     let stackEntry: StackEntry?
@@ -341,7 +350,9 @@ struct BatchPRStatusResponse: Codable {
     }
 
     /// Converts to GHPRDetailResponse so existing status-parsing logic can be reused.
-    func toDetailResponse() -> GHPRDetailResponse {
+    /// - Parameter viewerLogin: Login of the authenticated viewer, used to detect
+    ///   whether the viewer approved this PR (see `viewerApproved(viewerLogin:)`).
+    func toDetailResponse(viewerLogin: String?) -> GHPRDetailResponse {
         let flatRequests = reviewRequests?.nodes?.map {
             GHPRDetailResponse.ReviewRequest(login: $0.requestedReviewer?.login)
         }
@@ -355,15 +366,76 @@ struct BatchPRStatusResponse: Codable {
             latestReviews: latestReviews?.nodes,
             reviewRequests: flatRequests,
             requiredStatusCheckContexts: requiredStatusCheckContexts,
-            stack: stackEntry?.stackInfo
+            stack: stackEntry?.stackInfo,
+            viewerApproved: viewerApproved(viewerLogin: viewerLogin)
         )
+    }
+
+    /// Whether the authenticated viewer approved this PR, judged by their latest
+    /// opinionated review (`latestOpinionatedReviews` ignores later comments,
+    /// unlike `viewerLatestReview`). true = approved, false = the viewer's latest
+    /// opinionated review is not an approval, including when they have none;
+    /// nil = unknown (no viewer login, or the `latestOpinionatedReviews`
+    /// connection is absent from the response).
+    func viewerApproved(viewerLogin: String?) -> Bool? {
+        guard let viewerLogin, let nodes = latestOpinionatedReviews?.nodes else {
+            return nil
+        }
+        guard let viewerState = nodes.first(where: { $0.author?.login == viewerLogin })?.state else {
+            return false
+        }
+        return viewerState.uppercased() == "APPROVED"
     }
 }
 
 /// Top-level response from `gh api graphql` for a batch status query.
-/// `data` is a dictionary keyed by alias (e.g. "pr0", "pr1").
+/// `data` holds one repository per `pr<n>` alias (e.g. "pr0", "pr1") plus the
+/// authenticated `viewer`, which is used to detect the viewer's own approval.
 struct BatchGraphQLResponse: Codable {
-    let data: [String: RepositoryNode]
+    let data: BatchData
+
+    struct BatchData: Codable {
+        /// Login of the authenticated viewer, or nil when the query did not ask
+        /// for it or GitHub returned nothing.
+        let viewerLogin: String?
+
+        private let repositories: [String: RepositoryNode]
+
+        subscript(alias: String) -> RepositoryNode? {
+            repositories[alias]
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: DynamicKey.self)
+            if let viewerKey = DynamicKey(stringValue: "viewer") {
+                viewerLogin = (try? container.decode(Viewer.self, forKey: viewerKey))?.login
+            } else {
+                viewerLogin = nil
+            }
+
+            var decodedRepositories: [String: RepositoryNode] = [:]
+            for key in container.allKeys where key.stringValue != "viewer" {
+                decodedRepositories[key.stringValue] = try container.decode(RepositoryNode.self, forKey: key)
+            }
+            repositories = decodedRepositories
+        }
+
+        struct Viewer: Codable {
+            let login: String?
+        }
+
+        /// Coding key that accepts any string, so the dynamic `pr<n>` aliases and
+        /// the fixed `viewer` key can be read from the same object.
+        private struct DynamicKey: CodingKey {
+            var stringValue: String
+
+            init?(stringValue: String) { self.stringValue = stringValue }
+
+            var intValue: Int? { nil }
+
+            init?(intValue: Int) { nil }
+        }
+    }
 
     struct RepositoryNode: Codable {
         let pullRequest: BatchPRStatusResponse?
@@ -409,6 +481,7 @@ struct GHPRDetailResponse: Codable {
     let reviewRequests: [ReviewRequest]?
     let requiredStatusCheckContexts: [String]?
     let stack: PRStackInfo?
+    let viewerApproved: Bool?
 
     init(
         headRefName: String,
@@ -420,7 +493,8 @@ struct GHPRDetailResponse: Codable {
         latestReviews: [Review]?,
         reviewRequests: [ReviewRequest]?,
         requiredStatusCheckContexts: [String]? = nil,
-        stack: PRStackInfo? = nil
+        stack: PRStackInfo? = nil,
+        viewerApproved: Bool? = nil
     ) {
         self.headRefName = headRefName
         self.statusCheckRollup = statusCheckRollup
@@ -432,6 +506,7 @@ struct GHPRDetailResponse: Codable {
         self.reviewRequests = reviewRequests
         self.requiredStatusCheckContexts = requiredStatusCheckContexts
         self.stack = stack
+        self.viewerApproved = viewerApproved
     }
 
     struct Review: Codable {
