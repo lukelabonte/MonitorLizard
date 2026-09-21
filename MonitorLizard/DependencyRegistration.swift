@@ -240,7 +240,7 @@ private struct UnimplementedNotificationService: NotificationServicing {
         reportIssue("Unimplemented: NotificationServicing.notifyBuildComplete called without a test override")
     }
 
-    func notifyStackReady(stackID: String, stackNumber: Int, size: Int, allReady: Bool) {
+    func notifyStackReady(stack: ReadyStack) {
         reportIssue("Unimplemented: NotificationServicing.notifyStackReady called without a test override")
     }
 }

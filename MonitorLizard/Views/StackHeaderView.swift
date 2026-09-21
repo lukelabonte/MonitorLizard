@@ -84,6 +84,9 @@ struct StackHeaderView: View {
             }
             .buttonStyle(.plain)
             .help(header.helpText)
+            .accessibilityLabel("Stack \(header.number). \(header.summary)")
+            .accessibilityValue(isCollapsed ? "Collapsed" : "Expanded")
+            .accessibilityHint(isCollapsed ? "Expands the stack" : "Collapses the stack")
 
             // Watch - applies to every known part of the stack
             if header.hasStatusChecks {
@@ -125,7 +128,6 @@ struct StackHeaderView: View {
         .onChange(of: scrollViewHovered) {
             if !scrollViewHovered && isHovering { isHovering = false }
         }
-        .accessibilityLabel("Stack \(header.number), \(header.summary)")
     }
 
     private var summaryColor: Color {

@@ -61,10 +61,7 @@ struct PRStackHeader: Hashable, Identifiable {
     /// The part to work on next, when its position can be named unambiguously:
     /// every position below it is either visible or already merged.
     var startPart: PRStackPart? {
-        guard let first = visibleParts.first else { return nil }
-        let lowerPositions = Set(1..<first.position)
-        let accounted = readiness.landedPositions.union(visibleParts.map(\.position))
-        return lowerPositions.isSubset(of: accounted) ? first : nil
+        PRStackOrdering.nextPart(visibleParts: visibleParts, landedPositions: readiness.landedPositions)
     }
 
     /// One-line state summary shown next to the stack number.
@@ -113,11 +110,21 @@ struct ReadyStack: Hashable {
     /// True when every part of the stack is visible and ready; false when only the
     /// lowest part is known to be ready.
     let allReady: Bool
+
+    /// Position of the part to merge next, when it can be named unambiguously:
+    /// every position below it is either visible or already merged. Nil when a
+    /// lower position is neither, so the part that comes next cannot be known.
+    let nextPartPosition: Int?
+
+    /// Positions already merged, when the stack lookup reported them.
+    let landedPositions: Set<Int>
 }
 
 /// What the app can say about a stack's readiness to merge, based on the parts it
-/// can see. A stack can only advance from its lowest part, so the lowest part that
-/// is not ready is what everything above it is waiting on.
+/// can see. A stack can only advance from its lowest part, so `status` follows the
+/// lowest part and stays ready even when parts above it are not. `blockingPart`
+/// names the lowest blocked visible part — the one everything above it is waiting
+/// on — whenever one is visible.
 struct PRStackReadiness: Hashable {
     enum Status: Hashable {
         /// Every part of the stack is visible and ready to merge.
@@ -142,10 +149,20 @@ struct PRStackReadiness: Hashable {
     /// Positions already merged, when the stack lookup reported them.
     let landedPositions: Set<Int>
 
-    init(status: Status, size: Int, landedPositions: Set<Int> = []) {
+    /// The lowest blocked visible part: the one everything above it is waiting
+    /// on, whether or not the stack can advance past its lowest part.
+    let blockingPart: PRStackBlocker?
+
+    init(
+        status: Status,
+        size: Int,
+        landedPositions: Set<Int> = [],
+        blockingPart: PRStackBlocker? = nil
+    ) {
         self.status = status
         self.size = size
         self.landedPositions = landedPositions
+        self.blockingPart = blockingPart
     }
 
     /// True when the lowest unmerged part is ready, whether or not the parts above
@@ -223,9 +240,9 @@ enum PRStackOrdering {
     /// becomes one block — a header followed by its visible parts in merge order,
     /// part 1 (the one closest to the base branch) first.
     ///
-    /// A block is emitted where its first member appears in `prs`, so a stack does
-    /// not move around while the rest of the list changes. Collapsed stacks emit
-    /// only their header.
+    /// A block is emitted at its first member's occurrence in `prs`. Members that
+    /// share a stack position are emitted in unspecified order, since `sorted(by:)`
+    /// is not guaranteed to be stable. Collapsed stacks emit only their header.
     static func rows(from prs: [PullRequest], collapsedStackIDs: Set<String> = []) -> [PRListRow] {
         var membersByStack: [String: [PullRequest]] = [:]
         for pr in prs {
@@ -268,10 +285,7 @@ enum PRStackOrdering {
             }
             for member in ordered {
                 guard let memberStack = member.stack else { continue }
-                var isBlocking = false
-                if case .blocked(let blocker) = readiness.status, blocker.number == member.number {
-                    isBlocking = true
-                }
+                let isBlocking = readiness.blockingPart?.number == member.number
                 let helpText = [memberStack.helpText, readiness.helpText]
                     .compactMap { $0 }
                     .joined(separator: " ")
@@ -287,7 +301,10 @@ enum PRStackOrdering {
         return rows
     }
 
-    /// Readiness of a stack from the parts the app can see.
+    /// Readiness of a stack from the parts the app can see. A stack advances from
+    /// its lowest part, so the lowest visible member decides whether merging can
+    /// start; a blocked part above it only names what comes next, through
+    /// `blockingPart`.
     static func readiness(of members: [PullRequest], stackSize: Int) -> PRStackReadiness {
         let ordered = members.sorted {
             ($0.stack?.position ?? 0) < ($1.stack?.position ?? 0)
@@ -295,27 +312,60 @@ enum PRStackOrdering {
         // Merged parts stay in the stack but never appear in the user's searches,
         // so their positions count as satisfied rather than missing.
         let landed = Set(members.compactMap { $0.stack?.mergedPositions }.first ?? [])
+        let accounted = Set(ordered.compactMap { $0.stack?.position }).union(landed)
 
-        if let blocker = ordered.first(where: { $0.isMergeBlocked }) {
+        // The lowest blocked visible part, whether or not it holds the whole
+        // stack back: it is what everything above it is waiting on.
+        let blockingPart = ordered.first(where: { $0.isMergeBlocked }).map { member in
+            PRStackReadiness.PRStackBlocker(
+                position: member.stack?.position ?? 0,
+                number: member.number,
+                reason: member.mergeBlockReason ?? "not ready"
+            )
+        }
+
+        // Only the lowest visible member can hold the stack back; a blocked part
+        // above it does not stop the lowest part from merging.
+        if let lowest = ordered.first, lowest.isMergeBlocked, let blockingPart {
             return PRStackReadiness(
-                status: .blocked(PRStackReadiness.PRStackBlocker(
-                    position: blocker.stack?.position ?? 0,
-                    number: blocker.number,
-                    reason: blocker.mergeBlockReason ?? "not ready"
-                )),
+                status: .blocked(blockingPart),
                 size: stackSize,
-                landedPositions: landed
+                landedPositions: landed,
+                blockingPart: blockingPart
             )
         }
 
         let hasBase = landed.contains(1) || ordered.contains { $0.stack?.position == 1 }
         guard hasBase else {
-            return PRStackReadiness(status: .unknown, size: stackSize, landedPositions: landed)
+            return PRStackReadiness(
+                status: .unknown,
+                size: stackSize,
+                landedPositions: landed,
+                blockingPart: blockingPart
+            )
         }
 
-        let accounted = Set(ordered.compactMap { $0.stack?.position }).union(landed)
-        let status: PRStackReadiness.Status = accounted.count == stackSize ? .allReady : .readyToAdvance
-        return PRStackReadiness(status: status, size: stackSize, landedPositions: landed)
+        let status: PRStackReadiness.Status =
+            accounted.count == stackSize && blockingPart == nil
+                ? .allReady
+                : .readyToAdvance
+        return PRStackReadiness(
+            status: status,
+            size: stackSize,
+            landedPositions: landed,
+            blockingPart: blockingPart
+        )
+    }
+
+    /// The part to merge next, when it can be named unambiguously: the lowest
+    /// visible part whose lower positions are all either visible or already
+    /// merged. Nil when a lower position is neither, so the part that comes next
+    /// cannot be known from what is visible.
+    static func nextPart(visibleParts: [PRStackPart], landedPositions: Set<Int>) -> PRStackPart? {
+        guard let lowest = visibleParts.min(by: { $0.position < $1.position }) else { return nil }
+        let lowerPositions = Set(1..<lowest.position)
+        let accounted = landedPositions.union(visibleParts.map(\.position))
+        return lowerPositions.isSubset(of: accounted) ? lowest : nil
     }
 
     /// Stacks whose lowest part has just become ready to merge.
@@ -348,11 +398,20 @@ enum PRStackOrdering {
             readyStackIDs.insert(stackID)
             guard !previouslyReady.contains(stackID) else { continue }
 
+            let visibleParts = members.compactMap { member -> PRStackPart? in
+                guard let stack = member.stack else { return nil }
+                return PRStackPart(position: stack.position, number: member.number)
+            }
             newlyReady.append(ReadyStack(
                 id: stackID,
                 number: stackNumbers[stackID] ?? 0,
                 size: stackSize,
-                allReady: readiness.status == .allReady
+                allReady: readiness.status == .allReady,
+                nextPartPosition: nextPart(
+                    visibleParts: visibleParts,
+                    landedPositions: readiness.landedPositions
+                )?.position,
+                landedPositions: readiness.landedPositions
             ))
         }
 

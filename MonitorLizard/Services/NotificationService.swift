@@ -7,7 +7,7 @@ import UserNotifications
 protocol NotificationServicing: Sendable {
     func requestAuthorization() async throws
     func notifyBuildComplete(pr: PullRequest, status: BuildStatus)
-    func notifyStackReady(stackID: String, stackNumber: Int, size: Int, allReady: Bool)
+    func notifyStackReady(stack: ReadyStack)
 }
 
 /// Posts system notifications, plays sounds, and speaks announcements for build completions.
@@ -59,18 +59,24 @@ final class NotificationService: NotificationServicing, @unchecked Sendable {
         }
     }
 
-    func notifyStackReady(stackID: String, stackNumber: Int, size: Int, allReady: Bool) {
+    func notifyStackReady(stack: ReadyStack) {
         if notificationsEnabled {
             let content = UNMutableNotificationContent()
             content.title = "✅ Stack ready"
-            content.subtitle = "Stack #\(stackNumber)"
-            content.body = allReady
-                ? "All \(size) pull requests in this stack are ready to merge."
-                : "Part 1 of \(size) is ready to merge."
+            content.subtitle = "Stack #\(stack.number)"
+            if stack.allReady {
+                content.body = stack.landedPositions.isEmpty
+                    ? "All \(stack.size) pull requests in this stack are ready to merge."
+                    : "All remaining parts are ready to merge."
+            } else if let nextPartPosition = stack.nextPartPosition {
+                content.body = "Part \(nextPartPosition) of \(stack.size) is ready to merge."
+            } else {
+                content.body = "The next part of \(stack.size) is ready to merge."
+            }
             content.sound = .default
 
             let request = UNNotificationRequest(
-                identifier: "stack-\(stackID)",
+                identifier: "stack-\(stack.id)",
                 content: content,
                 trigger: nil
             )

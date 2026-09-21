@@ -42,12 +42,23 @@ class PRMonitorViewModel: ObservableObject {
     @Dependency(\.continuousClock) private var clock
 
     private let isDemoMode: Bool
+    /// How long a stack resolution is reused before the lookup repeats. Instance
+    /// state so tests can inject a tiny interval.
+    private let stackResolutionTTL: TimeInterval
 
     private var refreshTimer: Timer?
     private var defaultsObserver: AnyCancellable?
     private var unsortedPullRequests: [PullRequest] = []
     private var copiedPRLinkTask: Task<Void, Never>?
+    /// Stack ids already notified ready, seeded from preferences at launch so a
+    /// relaunch does not notify again for a stack that is still ready.
     private var readyStackIDs: Set<String> = []
+    /// Completed stacks for this session, keyed by stack id, so a poll that
+    /// still shows the same visible parts reuses the earlier lookup.
+    private var stackResolutionCache: [String: StackResolutionCacheEntry] = [:]
+    /// Stack parts removed this session, by PR id. Completion would otherwise
+    /// re-add them as companions for as long as a sibling anchor stays in a list.
+    private var removedStackPartIDs: Set<String> = []
 
     /// Stack blocks the user collapsed, by stack id. Session state: a freshly
     /// launched app starts with every block expanded.
@@ -154,8 +165,13 @@ class PRMonitorViewModel: ObservableObject {
         return daysSinceUpdate >= Double(inactiveBranchThresholdDays)
     }
 
-    init(isDemoMode: Bool = false) {
+    init(
+        isDemoMode: Bool = false,
+        stackResolutionTTL: TimeInterval = Constants.stackResolutionRevalidationInterval
+    ) {
         self.isDemoMode = isDemoMode
+        self.stackResolutionTTL = stackResolutionTTL
+        readyStackIDs = loadNotifiedReadyStackIDs()
         restoreFromCache()
         setupNotifications()
         startPolling()
@@ -266,7 +282,14 @@ class PRMonitorViewModel: ObservableObject {
             customNamesService.pruneStale(keeping: activeIDs)
 
             applySorting()
-            notifyReadyStacks(allPRs: mainPRs + otherPRs)
+            // A partial fetch omits whole stacks when one host's search fails, and
+            // readinessTransitions rebuilds the ready set from only the PRs present,
+            // so a stack missing here would be wrongly read as "no longer ready" and
+            // re-notify on the next full refresh. Defer the evaluation to the next
+            // full refresh instead.
+            if !fetchResult.isPartial {
+                notifyReadyStacks(allPRs: mainPRs + otherPRs)
+            }
 
             if !fetchResult.isPartial &&
                 selectedRepository != "All Repositories" &&
@@ -350,9 +373,28 @@ class PRMonitorViewModel: ObservableObject {
         return results
     }
 
+    /// One stack's completion lookup, kept for the session so a poll that still
+    /// shows the same visible parts reuses it instead of repeating the lookup.
+    private struct StackResolutionCacheEntry {
+        /// The PR numbers visible in the fetch when the stack was resolved. A
+        /// poll showing different numbers invalidates the entry: the stack moved.
+        let visibleNumbers: Set<Int>
+        /// The open parts the lookup returned that were not visible then.
+        let companionParts: [PullRequest]
+        /// Positions whose pull request had already merged.
+        let mergedPositions: [Int]
+        /// When the stack was resolved, for the revalidation interval.
+        let resolvedAt: Date
+    }
+
     /// Fetches the parts of any incomplete stack so a stack renders as a whole even
     /// when only one of its PRs matched the user's searches. Companions join the
     /// section of the stack's first anchor and share its type.
+    ///
+    /// Resolutions are cached per stack for the session: while the fetch keeps
+    /// showing the same visible parts and the revalidation interval has not
+    /// elapsed, the earlier lookup is reused instead of refetched. Parts the user
+    /// removed this session are never re-added.
     private func completeStacks(
         mainPRs: [PullRequest],
         otherPRs: [PullRequest]
@@ -376,8 +418,36 @@ class PRMonitorViewModel: ObservableObject {
                   let numbers = knownNumbers[stack.id],
                   numbers.count < stack.size else { continue }
 
-            let completion = await missingParts(for: anchor, stack: stack, knownNumbers: numbers)
-            let parts = completion.missingParts.filter { !knownIDs.contains($0.id) }
+            let completion: StackCompletion
+            if let cached = stackResolutionCache[stack.id],
+               cached.visibleNumbers == numbers,
+               Date().timeIntervalSince(cached.resolvedAt) < stackResolutionTTL {
+                // The fetch shows the same parts as when this stack was resolved,
+                // so reuse the earlier lookup instead of another round trip.
+                completion = StackCompletion(
+                    missingParts: cached.companionParts,
+                    mergedPositions: cached.mergedPositions
+                )
+            } else {
+                // A nil completion means the lookup failed; nothing is cached so
+                // the next poll retries it.
+                guard let resolved = await missingParts(for: anchor, stack: stack, knownNumbers: numbers) else {
+                    continue
+                }
+                completion = resolved
+                stackResolutionCache[stack.id] = StackResolutionCacheEntry(
+                    visibleNumbers: numbers,
+                    companionParts: resolved.missingParts,
+                    mergedPositions: resolved.mergedPositions,
+                    resolvedAt: Date()
+                )
+            }
+
+            // Exclusions are stored lowercased (see removeOtherPR), so compare the
+            // companion's id lowercased as well.
+            let parts = completion.missingParts.filter {
+                !knownIDs.contains($0.id) && !removedStackPartIDs.contains($0.id.lowercased())
+            }
 
             if mainPRs.contains(where: { $0.stack?.id == stack.id }) {
                 main.append(contentsOf: parts)
@@ -398,11 +468,14 @@ class PRMonitorViewModel: ObservableObject {
         return (main, other)
     }
 
+    /// Resolves the missing parts of a stack, or nil when the lookup failed. A
+    /// successful empty result is still a result: it means the stack has no open
+    /// parts beyond the visible ones.
     private func missingParts(
         for anchor: PullRequest,
         stack: PRStackInfo,
         knownNumbers: Set<Int>
-    ) async -> StackCompletion {
+    ) async -> StackCompletion? {
         let components = anchor.repository.nameWithOwner.split(separator: "/")
         guard components.count == 2 else { return .empty }
 
@@ -418,9 +491,10 @@ class PRMonitorViewModel: ObservableObject {
                 inactiveThresholdDays: inactiveBranchThresholdDays
             )
         } catch {
-            // Completing a stack is best-effort; a failure leaves the stack partial.
+            // Completing a stack is best-effort; a failure leaves the stack
+            // partial and is retried on the next poll.
             print("Transient error completing stack #\(stack.number): \(error)")
-            return .empty
+            return nil
         }
     }
 
@@ -474,6 +548,9 @@ class PRMonitorViewModel: ObservableObject {
             throw OtherPRError.notFound
         }
         otherPRsService.add(id)
+        // Re-adding a part revokes the session exclusion an earlier removal
+        // recorded, so stack completion is not permanently blocked for it.
+        removedStackPartIDs.remove(pr.id.lowercased())
         var updated = pr
         updated.isWatched = watchlistService.isWatched(pr)
         updated.customName = customNamesService.name(for: pr.id)
@@ -505,6 +582,15 @@ class PRMonitorViewModel: ObservableObject {
         guard let id = otherPRIdentifier(for: pr) else { return }
         otherPRsService.remove(id)
         customNamesService.removeName(for: pr.id)
+        // Only stacked parts can reappear once their pin is gone: completion
+        // re-adds them as companions while a sibling anchor remains in a list.
+        // Non-stacked PRs stay removed on their own, so they need no exclusion.
+        // Exclusions are lowercased because a pinned part's id casing comes from
+        // the URL the user typed, while completion rebuilds companions with the
+        // anchor's API-canonical casing.
+        if pr.stack != nil {
+            removedStackPartIDs.insert(pr.id.lowercased())
+        }
         otherPullRequests.removeAll { $0.id == pr.id }
         applySorting()
         if selectedRepository != "All Repositories" &&
@@ -625,8 +711,11 @@ class PRMonitorViewModel: ObservableObject {
 
     /// Notifies once per watched stack when it is ready to merge. A stack that
     /// becomes ready before anyone watches it stays pending, so watching it later
-    /// still produces the notification on the next refresh.
+    /// still produces the notification on the next refresh. The ids of stacks
+    /// already notified ready persist across launches; a stack that regresses is
+    /// dropped from them so its recovery notifies again.
     private func notifyReadyStacks(allPRs: [PullRequest]) {
+        let previouslyReady = readyStackIDs
         let transition = PRStackOrdering.readinessTransitions(previouslyReady: readyStackIDs, prs: allPRs)
         readyStackIDs = transition.readyStackIDs
 
@@ -638,12 +727,27 @@ class PRMonitorViewModel: ObservableObject {
                 readyStackIDs.remove(readyStack.id)
                 continue
             }
-            notificationService.notifyStackReady(
-                stackID: readyStack.id,
-                stackNumber: readyStack.number,
-                size: readyStack.size,
-                allReady: readyStack.allReady
-            )
+            notificationService.notifyStackReady(stack: readyStack)
+        }
+
+        if readyStackIDs != previouslyReady {
+            saveNotifiedReadyStackIDs(readyStackIDs)
+        }
+    }
+
+    /// The stack ids already notified ready, persisted so a relaunch does not
+    /// re-notify a stack that is still ready and still watched.
+    private func loadNotifiedReadyStackIDs() -> Set<String> {
+        guard let data = defaults.data(forKey: PreferenceKeys.notifiedReadyStacks),
+              let ids = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(ids)
+    }
+
+    private func saveNotifiedReadyStackIDs(_ ids: Set<String>) {
+        if let data = try? JSONEncoder().encode(ids.sorted()) {
+            defaults.set(data, forKey: PreferenceKeys.notifiedReadyStacks)
         }
     }
 

@@ -390,8 +390,11 @@ class GitHubService: GitHubServicing, ObservableObject {
         }
     }
 
-    /// True when a query failed because the host's schema has no stack fields, which
-    /// older GitHub Enterprise versions report as an unknown `stackEntry` field.
+    /// True when a query failed because the host's schema has no stack fields. The
+    /// failure must mention the `stackEntry` field name; GraphQL servers express the
+    /// unknown field in a variety of phrasings ("doesn't exist", "cannot query field",
+    /// "no such field", and similar), all accepted here so older GitHub Enterprise
+    /// hosts fall back to a stack-free query instead of failing to load entirely.
     nonisolated static func isStackInfoUnsupportedError(_ error: Error) -> Bool {
         guard case ShellError.executionFailed(let message) = error else { return false }
         let lowered = message.lowercased()
@@ -399,6 +402,11 @@ class GitHubService: GitHubServicing, ObservableObject {
         return lowered.contains("doesn't exist")
             || lowered.contains("does not exist")
             || lowered.contains("unknown field")
+            || lowered.contains("cannot query field")
+            || lowered.contains("not defined")
+            || lowered.contains("undefined field")
+            || lowered.contains("no such field")
+            || lowered.contains("unrecognized field")
     }
 
     // MARK: - Fetch
@@ -1118,9 +1126,19 @@ class GitHubService: GitHubServicing, ObservableObject {
         let json = try await executeGraphQL(host: host) { _ in
             GitHubService.buildStackEntriesQuery(stackID: stackID)
         }
-        guard let data = json.data(using: .utf8),
-              let response = try? JSONDecoder().decode(StackEntriesResponse.self, from: data),
-              let stack = response.data?.node else {
+        guard let data = json.data(using: .utf8) else {
+            throw GitHubError.invalidResponse
+        }
+        // An unparseable response is a failure: throwing makes the caller retry on
+        // the next poll and cache nothing. A nil `node`, by contrast, is a valid
+        // answer — the stack no longer exists — and still returns `.empty` below.
+        let response: StackEntriesResponse
+        do {
+            response = try JSONDecoder().decode(StackEntriesResponse.self, from: data)
+        } catch {
+            throw GitHubError.invalidResponse
+        }
+        guard let stack = response.data?.node else {
             return .empty
         }
 

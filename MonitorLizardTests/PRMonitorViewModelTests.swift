@@ -1041,6 +1041,11 @@ struct PRMonitorViewModelTests {
 @MainActor
 private final class StubGitHubService: GitHubServicing {
     var result = PRFetchResult(pullRequests: [], isPartial: false)
+    /// Pinned Other PRs returned by `fetchOtherPR`, matched by repository and
+    /// number.
+    var otherPRResults: [PullRequest] = []
+    /// Number of times `fetchMissingStackParts` has been called.
+    var fetchMissingStackPartsCallCount = 0
 
     func checkGHAvailable() async throws {}
     func invalidateHostsCache() {}
@@ -1054,7 +1059,10 @@ private final class StubGitHubService: GitHubServicing {
     }
 
     func fetchOtherPR(_ id: OtherPRIdentifier, enableInactiveDetection: Bool, inactiveThresholdDays: Int) async throws -> PullRequest? {
-        nil
+        let nameWithOwner = "\(id.owner)/\(id.repo)"
+        return otherPRResults.first {
+            $0.number == id.number && $0.repository.nameWithOwner == nameWithOwner
+        }
     }
 
     var stackParts: [PullRequest] = []
@@ -1070,7 +1078,8 @@ private final class StubGitHubService: GitHubServicing {
         enableInactiveDetection: Bool,
         inactiveThresholdDays: Int
     ) async throws -> StackCompletion {
-        StackCompletion(
+        fetchMissingStackPartsCallCount += 1
+        return StackCompletion(
             missingParts: stackParts.filter { !knownNumbers.contains($0.number) },
             mergedPositions: stackMergedPositions
         )
@@ -1078,26 +1087,20 @@ private final class StubGitHubService: GitHubServicing {
 }
 
 private final class StackReadySpy: NotificationServicing, @unchecked Sendable {
-    struct Notification: Equatable {
-        let number: Int
-        let size: Int
-        let allReady: Bool
-    }
-
     private let lock = NSLock()
-    private var recorded: [Notification] = []
+    private var recorded: [ReadyStack] = []
 
     func requestAuthorization() async throws {}
 
     func notifyBuildComplete(pr: PullRequest, status: BuildStatus) {}
 
-    func notifyStackReady(stackID: String, stackNumber: Int, size: Int, allReady: Bool) {
+    func notifyStackReady(stack: ReadyStack) {
         lock.lock()
         defer { lock.unlock() }
-        recorded.append(Notification(number: stackNumber, size: size, allReady: allReady))
+        recorded.append(stack)
     }
 
-    var notifications: [Notification] {
+    var notifications: [ReadyStack] {
         lock.lock()
         defer { lock.unlock() }
         return recorded
@@ -1108,7 +1111,12 @@ private final class StackReadySpy: NotificationServicing, @unchecked Sendable {
 @Suite(.serialized)
 struct StackWatchNotificationTests {
 
-    private func makeStackedPR(_ number: Int, position: Int, status: BuildStatus) -> PullRequest {
+    private func makeStackedPR(
+        _ number: Int,
+        position: Int,
+        status: BuildStatus,
+        stackSize: Int = 2
+    ) -> PullRequest {
         PullRequest(
             number: number,
             title: "PR #\(number)",
@@ -1125,7 +1133,7 @@ struct StackWatchNotificationTests {
             statusChecks: [],
             reviewDecision: nil,
             host: "github.com",
-            stack: PRStackInfo(id: "ST_stack", number: 42, size: 2, position: position)
+            stack: PRStackInfo(id: "ST_stack", number: 42, size: stackSize, position: position)
         )
     }
 
@@ -1172,10 +1180,177 @@ struct StackWatchNotificationTests {
         #expect(vm.authoredPRs.allSatisfy { $0.isWatched })
 
         await vm.refresh()
-        #expect(spy.notifications == [.init(number: 42, size: 2, allReady: true)])
+        #expect(spy.notifications == [.init(
+            id: "ST_stack",
+            number: 42,
+            size: 2,
+            allReady: true,
+            nextPartPosition: 1,
+            landedPositions: []
+        )])
 
         await vm.refresh()
         #expect(spy.notifications.count == 1, "A ready stack must only notify once")
+    }
+
+    @Test
+    func notifiesTheNextPartWhenLowerPartsHaveAlreadyMerged() async {
+        let stub = StubGitHubService()
+        let spy = StackReadySpy()
+        let vm = withDependencies {
+            $0.userDefaults = UserDefaultsStore.testSuite()
+            $0.watchlistService = WatchlistService()
+            $0.notificationService = spy
+            $0.otherPRsService = OtherPRsService()
+            $0.customNamesService = CustomNamesService()
+            $0.cacheService = PRCacheService()
+            $0[GitHubServiceKey.self] = stub
+        } operation: {
+            PRMonitorViewModel(isDemoMode: false)
+        }
+        vm.stopPolling()
+        // Let the poll started by init finish so only the refreshes below drive the spy.
+        for _ in 0..<40 {
+            if vm.lastRefreshTime != nil { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        // Part 1 has already merged, so part 2 of 3 is the one to merge next.
+        stub.result = PRFetchResult(pullRequests: [
+            makeStackedPR(2, position: 2, status: .success, stackSize: 3),
+        ], isPartial: false)
+        stub.stackMergedPositions = [1]
+        await vm.refresh()
+        #expect(spy.notifications.isEmpty, "An unwatched stack must not notify")
+
+        guard let pr = vm.authoredPRs.first else {
+            Issue.record("Expected an authored stack PR")
+            return
+        }
+        vm.toggleWatch(for: pr)
+        #expect(vm.authoredPRs.allSatisfy { $0.isWatched })
+
+        await vm.refresh()
+        #expect(spy.notifications == [.init(
+            id: "ST_stack",
+            number: 42,
+            size: 3,
+            allReady: false,
+            nextPartPosition: 2,
+            landedPositions: [1]
+        )])
+    }
+
+    @Test
+    func doesNotReNotifyAnAlreadyReadyWatchedStackAfterRelaunch() async {
+        let defaults = UserDefaultsStore.testSuite()
+        let stub = StubGitHubService()
+        let firstSpy = StackReadySpy()
+        let firstVM = withDependencies {
+            $0.userDefaults = defaults
+            $0.watchlistService = WatchlistService()
+            $0.notificationService = firstSpy
+            $0.otherPRsService = OtherPRsService()
+            $0.customNamesService = CustomNamesService()
+            $0.cacheService = PRCacheService()
+            $0[GitHubServiceKey.self] = stub
+        } operation: {
+            PRMonitorViewModel(isDemoMode: false)
+        }
+        firstVM.stopPolling()
+        // Let the poll started by init finish so only the refreshes below drive the spy.
+        for _ in 0..<40 {
+            if firstVM.lastRefreshTime != nil { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        stub.result = PRFetchResult(pullRequests: [
+            makeStackedPR(1, position: 1, status: .success),
+            makeStackedPR(2, position: 2, status: .success),
+        ], isPartial: false)
+        await firstVM.refresh()
+        #expect(firstSpy.notifications.isEmpty, "An unwatched stack must not notify")
+
+        guard let pr = firstVM.authoredPRs.first else {
+            Issue.record("Expected authored stack PRs")
+            return
+        }
+        firstVM.toggleWatch(for: pr)
+        await firstVM.refresh()
+        #expect(firstSpy.notifications.count == 1)
+
+        // A freshly constructed VM over the same defaults plays the role of a
+        // relaunch: it must not notify again for the already-ready watched stack.
+        let secondSpy = StackReadySpy()
+        let secondVM = withDependencies {
+            $0.userDefaults = defaults
+            $0.watchlistService = WatchlistService()
+            $0.notificationService = secondSpy
+            $0.otherPRsService = OtherPRsService()
+            $0.customNamesService = CustomNamesService()
+            $0.cacheService = PRCacheService()
+            $0[GitHubServiceKey.self] = stub
+        } operation: {
+            PRMonitorViewModel(isDemoMode: false)
+        }
+        secondVM.stopPolling()
+        // Wait for the initial refresh the relaunched VM schedules itself.
+        for _ in 0..<40 {
+            if secondVM.lastRefreshTime != nil { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        #expect(secondSpy.notifications.isEmpty, "An already-ready watched stack must not notify again after relaunch")
+    }
+
+    @Test
+    func partialFetchDoesNotDropAReadyWatchedStack() async {
+        let stub = StubGitHubService()
+        let spy = StackReadySpy()
+        let vm = withDependencies {
+            $0.userDefaults = UserDefaultsStore.testSuite()
+            $0.watchlistService = WatchlistService()
+            $0.notificationService = spy
+            $0.otherPRsService = OtherPRsService()
+            $0.customNamesService = CustomNamesService()
+            $0.cacheService = PRCacheService()
+            $0[GitHubServiceKey.self] = stub
+        } operation: {
+            PRMonitorViewModel(isDemoMode: false)
+        }
+        vm.stopPolling()
+        // Let the poll started by init finish so only the refreshes below drive the spy.
+        for _ in 0..<40 {
+            if vm.lastRefreshTime != nil { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        stub.result = PRFetchResult(pullRequests: [
+            makeStackedPR(1, position: 1, status: .success),
+            makeStackedPR(2, position: 2, status: .success),
+        ], isPartial: false)
+        await vm.refresh()
+        guard let pr = vm.authoredPRs.first else {
+            Issue.record("Expected authored stack PRs")
+            return
+        }
+        vm.toggleWatch(for: pr)
+        await vm.refresh()
+        #expect(spy.notifications.count == 1)
+
+        // A partial fetch that omits the stack entirely (one host's search failed)
+        // must not be read as "no longer ready": the ready set must survive it.
+        stub.result = PRFetchResult(pullRequests: [], isPartial: true)
+        await vm.refresh()
+        #expect(spy.notifications.count == 1)
+
+        // The next full refresh shows the stack ready again; it must not re-notify.
+        stub.result = PRFetchResult(pullRequests: [
+            makeStackedPR(1, position: 1, status: .success),
+            makeStackedPR(2, position: 2, status: .success),
+        ], isPartial: false)
+        await vm.refresh()
+        #expect(spy.notifications.count == 1, "A partial fetch must not shrink the ready set and re-notify")
     }
 }
 
@@ -1204,7 +1379,10 @@ struct StackCompletionTests {
         )
     }
 
-    private func makeVM(stub: StubGitHubService) async -> PRMonitorViewModel {
+    private func makeVM(
+        stub: StubGitHubService,
+        stackResolutionTTL: TimeInterval = Constants.stackResolutionRevalidationInterval
+    ) async -> PRMonitorViewModel {
         let vm = withDependencies {
             $0.userDefaults = UserDefaultsStore.testSuite()
             $0.watchlistService = WatchlistService()
@@ -1214,7 +1392,7 @@ struct StackCompletionTests {
             $0.cacheService = PRCacheService()
             $0[GitHubServiceKey.self] = stub
         } operation: {
-            PRMonitorViewModel(isDemoMode: false)
+            PRMonitorViewModel(isDemoMode: false, stackResolutionTTL: stackResolutionTTL)
         }
         vm.stopPolling()
         // Let the poll started by init finish before the explicit refresh.
@@ -1299,5 +1477,186 @@ struct StackCompletionTests {
         }
         #expect(header.readiness.landedPositions == [1])
         #expect(header.summary == "Part 1 merged · All remaining parts are ready to merge")
+    }
+
+    // MARK: - Stack resolution cache
+
+    @Test
+    func reusesAResolutionWhileTheVisiblePartsAreUnchangedAndRevalidatesWhenTheyChange() async {
+        let stub = StubGitHubService()
+        stub.result = PRFetchResult(
+            pullRequests: [stackedPR(3, position: 3, size: 4, type: .reviewing)],
+            isPartial: false
+        )
+        stub.stackParts = [
+            stackedPR(1, position: 1, size: 4, type: .reviewing),
+            stackedPR(2, position: 2, size: 4, type: .reviewing),
+            stackedPR(4, position: 4, size: 4, type: .reviewing),
+        ]
+
+        // The initial refresh resolves the stack once.
+        let vm = await makeVM(stub: stub)
+        #expect(stub.fetchMissingStackPartsCallCount == 1)
+
+        // The next poll sees the same visible part, so the cached resolution is
+        // reused instead of refetching.
+        await vm.refresh()
+        #expect(stub.fetchMissingStackPartsCallCount == 1)
+        #expect(vm.reviewPRs.map(\.number) == [1, 2, 3, 4])
+
+        // A part appearing in the searches changes the visible set and must
+        // trigger a fresh lookup even inside the interval.
+        stub.result = PRFetchResult(
+            pullRequests: [
+                stackedPR(2, position: 2, size: 4, type: .reviewing),
+                stackedPR(3, position: 3, size: 4, type: .reviewing),
+            ],
+            isPartial: false
+        )
+        await vm.refresh()
+        #expect(stub.fetchMissingStackPartsCallCount == 2)
+        #expect(vm.reviewPRs.map(\.number) == [1, 2, 3, 4])
+    }
+
+    @Test
+    func revalidatesACachedStackOnceTheIntervalElapses() async {
+        let stub = StubGitHubService()
+        stub.result = PRFetchResult(
+            pullRequests: [stackedPR(3, position: 3, size: 4, type: .reviewing)],
+            isPartial: false
+        )
+        stub.stackParts = [
+            stackedPR(1, position: 1, size: 4, type: .reviewing),
+            stackedPR(2, position: 2, size: 4, type: .reviewing),
+            stackedPR(4, position: 4, size: 4, type: .reviewing),
+        ]
+
+        // A zero interval expires the cached resolution immediately, so the
+        // second refresh resolves again even though nothing visible changed.
+        let vm = await makeVM(stub: stub, stackResolutionTTL: 0)
+        #expect(stub.fetchMissingStackPartsCallCount == 1)
+
+        await vm.refresh()
+        #expect(stub.fetchMissingStackPartsCallCount == 2)
+        #expect(vm.reviewPRs.map(\.number) == [1, 2, 3, 4])
+    }
+}
+
+@MainActor
+@Suite(.serialized)
+struct StackPartRemovalTests {
+
+    private func pinnedPart(
+        _ number: Int,
+        position: Int,
+        nameWithOwner: String = "acme/widget"
+    ) -> PullRequest {
+        PullRequest(
+            number: number,
+            title: "PR #\(number)",
+            repository: PullRequest.RepositoryInfo(name: "widget", nameWithOwner: nameWithOwner),
+            url: "https://github.com/\(nameWithOwner)/pull/\(number)",
+            author: PullRequest.Author(login: "alice"),
+            headRefName: "feature/\(number)",
+            updatedAt: Date(),
+            buildStatus: .success,
+            isWatched: false,
+            labels: [],
+            type: .other,
+            isDraft: false,
+            statusChecks: [],
+            reviewDecision: nil,
+            host: "github.com",
+            stack: PRStackInfo(id: "ST_remove", number: 7, size: 2, position: position)
+        )
+    }
+
+    private func makeVM(defaults: UserDefaultsStore, stub: StubGitHubService) async -> PRMonitorViewModel {
+        let vm = withDependencies {
+            $0.userDefaults = defaults
+            $0.watchlistService = WatchlistService()
+            $0.notificationService = NotificationService()
+            $0.otherPRsService = OtherPRsService()
+            $0.customNamesService = CustomNamesService()
+            $0.cacheService = PRCacheService()
+            $0[GitHubServiceKey.self] = stub
+        } operation: {
+            PRMonitorViewModel(isDemoMode: false)
+        }
+        vm.stopPolling()
+        // Let the poll started by init finish before the explicit refreshes.
+        for _ in 0..<40 {
+            if vm.lastRefreshTime != nil { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        return vm
+    }
+
+    @Test
+    func removedStackPartIsNotReAddedAndReAddingClearsTheExclusion() async throws {
+        let defaults = UserDefaultsStore.testSuite()
+        let stub = StubGitHubService()
+        let part1 = pinnedPart(101, position: 1)
+        let part2 = pinnedPart(102, position: 2)
+        stub.otherPRResults = [part1]
+        stub.stackParts = [part2]
+
+        let vm = await makeVM(defaults: defaults, stub: stub)
+
+        // Pin part 1 only; completion adds its sibling part 2 as a companion.
+        try await vm.addOtherPR(urlString: "https://github.com/acme/widget/pull/101")
+        await vm.refresh()
+        #expect(vm.filteredOtherPRs.map(\.number) == [101, 102])
+
+        // Removing the companion must stick across refreshes while the pinned
+        // sibling keeps the stack alive.
+        vm.removeOtherPR(part2)
+        await vm.refresh()
+        #expect(vm.filteredOtherPRs.map(\.number) == [101], "A removed stack part must not be re-added while a sibling anchor remains")
+
+        // Re-adding the part clears the exclusion. Make its own fetch go stale
+        // so only completion can bring it back, proving the exclusion is gone.
+        stub.otherPRResults = [part1, part2]
+        try await vm.addOtherPR(urlString: "https://github.com/acme/widget/pull/102")
+        stub.otherPRResults = [part1]
+        await vm.refresh()
+        #expect(vm.filteredOtherPRs.map(\.number) == [101, 102], "Re-adding a part must clear the exclusion so completion is not permanently blocked")
+    }
+
+    @Test
+    func removalExclusionMatchesACompanionRebuiltUnderADifferentRepoCasing() async throws {
+        let defaults = UserDefaultsStore.testSuite()
+        let stub = StubGitHubService()
+        // The anchor is pinned under the API-canonical casing; the other part comes
+        // from a URL the user typed with different casing, so its id is
+        // "Acme/Widget#102". Completion rebuilds companions with the anchor's
+        // casing, producing "acme/widget#102" — the same part, different id case.
+        let anchor = pinnedPart(101, position: 1)
+        let pinnedWithTypedCasing = pinnedPart(102, position: 2, nameWithOwner: "Acme/Widget")
+        let rebuiltCompanion = pinnedPart(102, position: 2)
+        stub.otherPRResults = [anchor, pinnedWithTypedCasing]
+        stub.stackParts = [rebuiltCompanion]
+
+        let vm = await makeVM(defaults: defaults, stub: stub)
+
+        // Pin both parts; the anchor keeps the stack alive after the other is removed.
+        try await vm.addOtherPR(urlString: "https://github.com/acme/widget/pull/101")
+        try await vm.addOtherPR(urlString: "https://github.com/Acme/Widget/pull/102")
+        await vm.refresh()
+        #expect(vm.filteredOtherPRs.map(\.number) == [101, 102])
+
+        // Removing the typed-casing part must stick: the next completion rebuilds it
+        // as "acme/widget#102", and the lowercased exclusion must still match.
+        vm.removeOtherPR(pinnedWithTypedCasing)
+        await vm.refresh()
+        #expect(vm.filteredOtherPRs.map(\.number) == [101], "A removed stack part must stay removed even when completion rebuilds it under the anchor's casing")
+
+        // Re-adding clears the exclusion. Make its own fetch go stale so only
+        // completion can bring it back, proving the exclusion is gone.
+        stub.otherPRResults = [anchor, pinnedWithTypedCasing]
+        try await vm.addOtherPR(urlString: "https://github.com/Acme/Widget/pull/102")
+        stub.otherPRResults = [anchor]
+        await vm.refresh()
+        #expect(vm.filteredOtherPRs.map(\.number) == [101, 102], "Re-adding a part must clear the exclusion regardless of its id casing")
     }
 }

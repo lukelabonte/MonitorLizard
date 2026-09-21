@@ -709,6 +709,35 @@ struct GitHubServiceBatchIntegrationTests {
         #expect(completion.mergedPositions == [3])
     }
 
+    @Test func fetchMissingStackPartsThrowsWhenTheStackEntriesResponseIsUnparseable() async {
+        // An unparseable response must surface as an error rather than an empty
+        // completion, so the caller retries on the next poll and caches nothing.
+        let mock = MockShellExecutor(
+            executeResponseMatchers: [
+                ("node(id:", .success("this is not JSON")),
+            ]
+        )
+        let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }
+
+        do {
+            _ = try await service.fetchMissingStackParts(
+                stackID: "PRS_stack",
+                host: "github.com",
+                owner: "acme",
+                repo: "widget",
+                knownNumbers: [102],
+                type: .reviewing,
+                enableInactiveDetection: false,
+                inactiveThresholdDays: 3
+            )
+            Issue.record("Expected an error to be thrown")
+        } catch let error as GitHubError {
+            #expect(error == .invalidResponse)
+        } catch {
+            Issue.record("Unexpected error type: \(error)")
+        }
+    }
+
     @Test func fetchAllOpenPRsRemembersHostsWithoutStackInfo() async throws {
         let mock = Self.stackUnsupportedMock()
         let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }

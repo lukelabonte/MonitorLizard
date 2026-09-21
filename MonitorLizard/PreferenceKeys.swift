@@ -18,6 +18,7 @@ enum PreferenceKeys: String, Sendable {
     case cachedOtherPRs
     case pinnedPRs
     case customPRNames
+    case notifiedReadyStacks
 }
 
 extension PreferenceKeys: CustomStringConvertible {

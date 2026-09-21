@@ -118,7 +118,12 @@ struct GitHubServiceBatchQueryTests {
         for message in [
             "gh: Field 'stackEntry' doesn't exist on type 'PullRequest'",
             "GraphQL: Field 'stackEntry' does not exist on type 'PullRequest'",
-            "Unknown field 'stackEntry'",
+            "Unknown field 'stackEntry' on type 'PullRequest'",
+            "Cannot query field \"stackEntry\" on type \"PullRequest\".",
+            "Field 'stackEntry' not defined on type 'PullRequest'",
+            "No such field 'stackEntry' on type 'PullRequest'",
+            "Unrecognized field 'stackEntry' on type 'PullRequest'",
+            "Undefined field 'stackEntry' on type 'PullRequest'",
         ] {
             #expect(GitHubService.isStackInfoUnsupportedError(ShellError.executionFailed(message)))
         }
