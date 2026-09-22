@@ -59,6 +59,10 @@ class PRMonitorViewModel: ObservableObject {
     /// Stack parts removed this session, by PR id. Completion would otherwise
     /// re-add them as companions for as long as a sibling anchor stays in a list.
     private var removedStackPartIDs: Set<String> = []
+    /// Stack parts currently in the lists only because completion added them,
+    /// by PR id. Rebuilt on every refresh from the parts actually appended, so
+    /// `isStackCompanion(_:)` can mark rows the user did not ask to track.
+    private var stackCompanionIDs: Set<String> = []
 
     /// Stack blocks the user collapsed, by stack id. Session state: a freshly
     /// launched app starts with every block expanded.
@@ -124,7 +128,7 @@ class PRMonitorViewModel: ObservableObject {
     }
 
     /// Rows for a section: unstacked PRs as-is, each stack as one block (header plus
-    /// its parts, newest part first so the base sits at the bottom).
+    /// its parts in merge order, part 1 first so the base sits at the top).
     func sectionRows(for type: PRType) -> [PRListRow] {
         PRStackOrdering.rows(from: sectionPRs(for: type), collapsedStackIDs: collapsedStackIDs)
     }
@@ -389,7 +393,9 @@ class PRMonitorViewModel: ObservableObject {
 
     /// Fetches the parts of any incomplete stack so a stack renders as a whole even
     /// when only one of its PRs matched the user's searches. Companions join the
-    /// section of the stack's first anchor and share its type.
+    /// section of the stack's first anchor and share its type, and are marked as
+    /// companions (`isStackCompanion`) so their rows can show they are someone
+    /// else's PR rather than something from the user's own lists.
     ///
     /// Resolutions are cached per stack for the session: while the fetch keeps
     /// showing the same visible parts and the revalidation interval has not
@@ -400,6 +406,13 @@ class PRMonitorViewModel: ObservableObject {
         otherPRs: [PullRequest]
     ) async -> (main: [PullRequest], other: [PullRequest]) {
         guard !isDemoMode else { return (mainPRs, otherPRs) }
+
+        // Collected locally and published once at the end, so the marks on the
+        // still-displayed lists never flicker off while this function is
+        // suspended on network awaits. Rebuilt fresh every call from the parts
+        // appended below, so a part that stops being a companion (it matched a
+        // search, merged, or closed) loses its marking on the same refresh.
+        var companionIDs: Set<String> = []
 
         let knownIDs = Set((mainPRs + otherPRs).map(\.id))
         var knownNumbers: [String: Set<Int>] = [:]
@@ -448,6 +461,7 @@ class PRMonitorViewModel: ObservableObject {
             let parts = completion.missingParts.filter {
                 !knownIDs.contains($0.id) && !removedStackPartIDs.contains($0.id.lowercased())
             }
+            companionIDs.formUnion(parts.map(\.id))
 
             if mainPRs.contains(where: { $0.stack?.id == stack.id }) {
                 main.append(contentsOf: parts)
@@ -465,6 +479,9 @@ class PRMonitorViewModel: ObservableObject {
             }
         }
 
+        // Publish the rebuilt companion marks in one step, after every network
+        // await in this function has resolved.
+        stackCompanionIDs = companionIDs
         return (main, other)
     }
 
@@ -565,6 +582,14 @@ class PRMonitorViewModel: ObservableObject {
     func isPinnedPR(_ pr: PullRequest) -> Bool {
         guard let id = otherPRIdentifier(for: pr) else { return false }
         return otherPRsService.contains(id)
+    }
+
+    /// True when this PR is a stack companion: a part the completion lookup
+    /// added because a sibling anchored a stack in the user's lists, not
+    /// something the user tracks themselves. Pinned PRs win: a part the user
+    /// added by URL is theirs, not a companion.
+    func isStackCompanion(_ pr: PullRequest) -> Bool {
+        stackCompanionIDs.contains(pr.id) && !isPinnedPR(pr)
     }
 
     private func otherPRIdentifier(for pr: PullRequest) -> OtherPRIdentifier? {

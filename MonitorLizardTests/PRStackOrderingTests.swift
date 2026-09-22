@@ -191,6 +191,23 @@ struct PRStackOrderingTests {
         }
     }
 
+    @Test func blockingRowCarriesItsReasonIntoTheRowContext() {
+        let rows = PRStackOrdering.rows(from: [
+            makePR(1, position: 1),
+            makePR(2, position: 2),
+            makePR(3, position: 3, status: .failure),
+        ])
+
+        for row in rows {
+            guard case .pr(let pr, let context) = row else { continue }
+            #expect(context?.isBlocking == (pr.number == 3))
+            #expect(context?.blockingReason == (pr.number == 3 ? "failing checks" : nil))
+            if pr.number == 3 {
+                #expect(context?.helpText.contains("Waiting on part 3 of 4 (failing checks).") == true)
+            }
+        }
+    }
+
     @Test func mergedLowerPartsAreAccountedForInTheHeader() {
         let rows = PRStackOrdering.rows(from: [
             makePR(2, stackSize: 3, position: 2, mergedPositions: [1]),
@@ -254,7 +271,8 @@ struct PRStackReadinessTests {
         stackSize: Int,
         status: BuildStatus = .success,
         reviewDecision: ReviewDecision? = nil,
-        mergedPositions: [Int]? = nil
+        mergedPositions: [Int]? = nil,
+        isDraft: Bool = false
     ) -> PullRequest {
         PullRequest(
             number: number,
@@ -268,7 +286,7 @@ struct PRStackReadinessTests {
             isWatched: false,
             labels: [],
             type: .reviewing,
-            isDraft: false,
+            isDraft: isDraft,
             statusChecks: [],
             reviewDecision: reviewDecision,
             host: "github.com",
@@ -318,6 +336,79 @@ struct PRStackReadinessTests {
         #expect(readiness.status == .readyToAdvance)
         #expect(readiness.isReadyToAdvance)
         #expect(readiness.blockingPart == .init(position: 2, number: 2, reason: "changes requested"))
+    }
+
+    // MARK: - Drafts count as blocked
+
+    @Test func draftLowestPartBlocksTheStack() {
+        // A draft cannot merge even with green checks, so a ready-looking draft
+        // base must hold the stack back instead of reading as ready.
+        let readiness = PRStackOrdering.readiness(
+            of: [
+                makePR(1, position: 1, stackSize: 2, isDraft: true),
+                makePR(2, position: 2, stackSize: 2),
+            ],
+            stackSize: 2
+        )
+
+        #expect(readiness.status == .blocked(.init(position: 1, number: 1, reason: "draft")))
+        #expect(readiness.isReadyToAdvance == false)
+    }
+
+    @Test func draftPartAboveAReadyBaseIsTheBlockingPart() {
+        let readiness = PRStackOrdering.readiness(
+            of: [
+                makePR(1, position: 1, stackSize: 3),
+                makePR(2, position: 2, stackSize: 3, isDraft: true),
+                makePR(3, position: 3, stackSize: 3),
+            ],
+            stackSize: 3
+        )
+
+        #expect(readiness.status == .readyToAdvance)
+        #expect(readiness.blockingPart?.reason == "draft")
+    }
+
+    @Test func draftReasonWinsWhenChecksAlsoFail() {
+        let readiness = PRStackOrdering.readiness(
+            of: [makePR(1, position: 1, stackSize: 2, status: .failure, isDraft: true)],
+            stackSize: 2
+        )
+
+        #expect(readiness.status == .blocked(.init(position: 1, number: 1, reason: "draft")))
+    }
+
+    // MARK: - Readiness help text
+
+    @Test func readyToAdvanceHelpTextNamesTheBlockingUpperPart() {
+        let readiness = PRStackOrdering.readiness(
+            of: [
+                makePR(1, position: 1, stackSize: 4),
+                makePR(2, position: 2, stackSize: 4),
+                makePR(3, position: 3, stackSize: 4, status: .failure),
+            ],
+            stackSize: 4
+        )
+
+        #expect(readiness.status == .readyToAdvance)
+        #expect(readiness.helpText == "Part 1 is ready to merge. Waiting on part 3 of 4 (failing checks).")
+    }
+
+    @Test func blockedAndAllReadyHelpTextsKeepTheirPhrasing() {
+        let blocked = PRStackOrdering.readiness(
+            of: [makePR(1, position: 1, stackSize: 2, status: .pending)],
+            stackSize: 2
+        )
+        #expect(blocked.helpText == "Waiting on part 1 of 2 (checks pending).")
+
+        let allReady = PRStackOrdering.readiness(
+            of: [
+                makePR(1, position: 1, stackSize: 2),
+                makePR(2, position: 2, stackSize: 2),
+            ],
+            stackSize: 2
+        )
+        #expect(allReady.helpText == "All 2 parts are ready to merge.")
     }
 
     @Test func allPartsVisibleAndReadyMeansAllReady() {
@@ -419,7 +510,8 @@ struct PRStackReadinessTransitionTests {
         position: Int,
         status: BuildStatus,
         stackSize: Int = 2,
-        mergedPositions: [Int]? = nil
+        mergedPositions: [Int]? = nil,
+        isDraft: Bool = false
     ) -> PullRequest {
         PullRequest(
             number: number,
@@ -433,7 +525,7 @@ struct PRStackReadinessTransitionTests {
             isWatched: false,
             labels: [],
             type: .reviewing,
-            isDraft: false,
+            isDraft: isDraft,
             statusChecks: [],
             reviewDecision: nil,
             host: "github.com",
@@ -527,6 +619,23 @@ struct PRStackReadinessTransitionTests {
         #expect(regressed.newlyReady.isEmpty)
         #expect(recovered.newlyReady.count == 1)
     }
+
+    @Test func aDraftBaseKeepsTheStackUnreadyUntilItIsPublished() {
+        // A draft base cannot merge, so the stack must not be reported ready;
+        // publishing the same part (checks already green) makes it ready.
+        let draftBase = [makePR(1, position: 1, status: .success, isDraft: true)]
+        let publishedBase = [makePR(1, position: 1, status: .success)]
+
+        let whileDraft = PRStackOrdering.readinessTransitions(previouslyReady: [], prs: draftBase)
+        #expect(whileDraft.newlyReady.isEmpty)
+        #expect(whileDraft.readyStackIDs.isEmpty)
+
+        let oncePublished = PRStackOrdering.readinessTransitions(
+            previouslyReady: whileDraft.readyStackIDs,
+            prs: publishedBase
+        )
+        #expect(oncePublished.newlyReady.count == 1)
+    }
 }
 
 @MainActor
@@ -535,14 +644,79 @@ struct PRStackInfoTests {
     @Test func labelsFirstStackEntryAsTheOneToMergeFirst() {
         let first = PRStackInfo(id: "stack-1", number: 42, size: 4, position: 1)
 
-        #expect(first.positionLabel == "1/4")
         #expect(first.helpText == "Stack #42, part 1 of 4. Merge this one first.")
     }
 
     @Test func labelsLaterStackEntriesAsFollowingThePreviousPart() {
         let third = PRStackInfo(id: "stack-1", number: 42, size: 4, position: 3)
 
-        #expect(third.positionLabel == "3/4")
         #expect(third.helpText == "Stack #42, part 3 of 4. Merge after part 2.")
+    }
+}
+
+@MainActor
+struct StackReadyNotificationContentTests {
+
+    @Test func allReadyStackWithoutLandedPartsListsEveryPart() {
+        let stack = ReadyStack(
+            id: "ST_1",
+            number: 7,
+            size: 4,
+            allReady: true,
+            nextPartPosition: 1,
+            landedPositions: []
+        )
+
+        let content = NotificationService.stackReadyContent(for: stack)
+
+        #expect(content.title == "✅ Stack ready")
+        #expect(content.subtitle == "Stack #7")
+        #expect(content.body == "All 4 pull requests in this stack are ready to merge.")
+        #expect(content.identifier == "stack-ST_1")
+    }
+
+    @Test func allReadyStackWithLandedPartsListsTheRemainder() {
+        let stack = ReadyStack(
+            id: "ST_1",
+            number: 7,
+            size: 4,
+            allReady: true,
+            nextPartPosition: 3,
+            landedPositions: [1, 2]
+        )
+
+        let content = NotificationService.stackReadyContent(for: stack)
+
+        #expect(content.body == "All remaining parts are ready to merge.")
+    }
+
+    @Test func partiallyVisibleStackNamesItsNextPart() {
+        let stack = ReadyStack(
+            id: "ST_1",
+            number: 7,
+            size: 3,
+            allReady: false,
+            nextPartPosition: 2,
+            landedPositions: [1]
+        )
+
+        let content = NotificationService.stackReadyContent(for: stack)
+
+        #expect(content.body == "Part 2 of 3 is ready to merge.")
+    }
+
+    @Test func stackWithoutANamableNextPartFallsBack() {
+        let stack = ReadyStack(
+            id: "ST_1",
+            number: 7,
+            size: 4,
+            allReady: false,
+            nextPartPosition: nil,
+            landedPositions: []
+        )
+
+        let content = NotificationService.stackReadyContent(for: stack)
+
+        #expect(content.body == "The next part of 4 is ready to merge.")
     }
 }

@@ -1046,6 +1046,17 @@ private final class StubGitHubService: GitHubServicing {
     var otherPRResults: [PullRequest] = []
     /// Number of times `fetchMissingStackParts` has been called.
     var fetchMissingStackPartsCallCount = 0
+    /// The identifying arguments of every `fetchMissingStackParts` call, in
+    /// order, so tests can assert what the ViewModel passed to the service.
+    var fetchMissingStackPartsCalls: [FetchMissingStackPartsCall] = []
+
+    struct FetchMissingStackPartsCall {
+        let stackID: String
+        let host: String
+        let owner: String
+        let repo: String
+        let type: PRType
+    }
 
     func checkGHAvailable() async throws {}
     func invalidateHostsCache() {}
@@ -1079,6 +1090,15 @@ private final class StubGitHubService: GitHubServicing {
         inactiveThresholdDays: Int
     ) async throws -> StackCompletion {
         fetchMissingStackPartsCallCount += 1
+        fetchMissingStackPartsCalls.append(
+            FetchMissingStackPartsCall(
+                stackID: stackID,
+                host: host,
+                owner: owner,
+                repo: repo,
+                type: type
+            )
+        )
         return StackCompletion(
             missingParts: stackParts.filter { !knownNumbers.contains($0.number) },
             mergedPositions: stackMergedPositions
@@ -1434,6 +1454,56 @@ struct StackCompletionTests {
     }
 
     @Test
+    func passesTheAnchorsStackIdentityToTheCompletionLookup() async throws {
+        let stub = StubGitHubService()
+        stub.result = PRFetchResult(
+            pullRequests: [stackedPR(3, position: 3, size: 4, type: .reviewing)],
+            isPartial: false
+        )
+        stub.stackParts = [
+            stackedPR(1, position: 1, size: 4, type: .reviewing),
+            stackedPR(2, position: 2, size: 4, type: .reviewing),
+            stackedPR(4, position: 4, size: 4, type: .reviewing),
+        ]
+
+        let vm = await makeVM(stub: stub)
+        await vm.refresh()
+
+        #expect(stub.fetchMissingStackPartsCalls.count == 1)
+        let call = try #require(stub.fetchMissingStackPartsCalls.first)
+        #expect(call.stackID == "ST_stack")
+        #expect(call.host == "github.com")
+        #expect(call.owner == "acme")
+        #expect(call.repo == "widget")
+        #expect(call.type == .reviewing)
+    }
+
+    @Test
+    func marksFetchedCompanionsWithoutMarkingSearchedParts() async throws {
+        let stub = StubGitHubService()
+        stub.result = PRFetchResult(
+            pullRequests: [stackedPR(3, position: 3, size: 4, type: .reviewing)],
+            isPartial: false
+        )
+        stub.stackParts = [
+            stackedPR(1, position: 1, size: 4, type: .reviewing),
+            stackedPR(2, position: 2, size: 4, type: .reviewing),
+            stackedPR(4, position: 4, size: 4, type: .reviewing),
+        ]
+
+        let vm = await makeVM(stub: stub)
+        await vm.refresh()
+
+        for number in [1, 2, 4] {
+            let companion = try #require(vm.reviewPRs.first { $0.number == number })
+            #expect(vm.isStackCompanion(companion), "fetched part #\(number) is a companion")
+        }
+        // The part that came from the user's own searches is not a companion.
+        let anchor = try #require(vm.reviewPRs.first { $0.number == 3 })
+        #expect(!vm.isStackCompanion(anchor))
+    }
+
+    @Test
     func leavesAStackAloneWhenItsPartsAreAllPresent() async {
         let stub = StubGitHubService()
         stub.result = PRFetchResult(
@@ -1658,5 +1728,61 @@ struct StackPartRemovalTests {
         stub.otherPRResults = [anchor]
         await vm.refresh()
         #expect(vm.filteredOtherPRs.map(\.number) == [101, 102], "Re-adding a part must clear the exclusion regardless of its id casing")
+    }
+
+    @Test
+    func isPinnedPRClassifiesPinnedCompanionAndAuthoredPRs() async throws {
+        let defaults = UserDefaultsStore.testSuite()
+        let stub = StubGitHubService()
+        let pinned = pinnedPart(101, position: 1)
+        stub.result = PRFetchResult(pullRequests: [], isPartial: false)
+        stub.otherPRResults = [pinned]
+
+        let vm = await makeVM(defaults: defaults, stub: stub)
+        try await vm.addOtherPR(urlString: "https://github.com/acme/widget/pull/101")
+
+        #expect(vm.isPinnedPR(pinned), "the part the user pinned is pinned")
+        #expect(!vm.isPinnedPR(pinnedPart(102, position: 2)), "a companion part is not pinned")
+        #expect(!vm.isPinnedPR(unstackedAuthoredPR()), "an authored PR is never pinned")
+    }
+
+    @Test
+    func pinnedPartsAreNotCompanions() async throws {
+        let defaults = UserDefaultsStore.testSuite()
+        let stub = StubGitHubService()
+        let anchor = pinnedPart(101, position: 1)
+        let companion = pinnedPart(102, position: 2)
+        stub.result = PRFetchResult(pullRequests: [], isPartial: false)
+        stub.otherPRResults = [anchor]
+        stub.stackParts = [companion]
+
+        let vm = await makeVM(defaults: defaults, stub: stub)
+        try await vm.addOtherPR(urlString: "https://github.com/acme/widget/pull/101")
+        await vm.refresh()
+
+        #expect(vm.filteredOtherPRs.map(\.number) == [101, 102])
+        #expect(vm.isPinnedPR(anchor))
+        #expect(!vm.isStackCompanion(anchor), "a part the user pinned is theirs, not a companion")
+        #expect(vm.isStackCompanion(companion))
+    }
+
+    private func unstackedAuthoredPR() -> PullRequest {
+        PullRequest(
+            number: 55,
+            title: "My own PR",
+            repository: PullRequest.RepositoryInfo(name: "widget", nameWithOwner: "acme/widget"),
+            url: "https://github.com/acme/widget/pull/55",
+            author: PullRequest.Author(login: "alice"),
+            headRefName: "feature/55",
+            updatedAt: Date(),
+            buildStatus: .success,
+            isWatched: false,
+            labels: [],
+            type: .authored,
+            isDraft: false,
+            statusChecks: [],
+            reviewDecision: nil,
+            host: "github.com"
+        )
     }
 }

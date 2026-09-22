@@ -610,21 +610,22 @@ struct GitHubServiceBatchIntegrationTests {
         #expect(queries.contains { !$0.contains("stackEntry") })
     }
 
-    private static func stackPartDetailJSON(number: Int, position: Int) -> String {
-        """
-        {
-          "data": {
-            "pr0": {
+    /// A batch detail response with one aliased part per entry, the shape
+    /// `buildBatchDetailQuery` produces for stack completion.
+    private static func stackPartsDetailResponse(_ entries: [(number: Int, position: Int)]) -> String {
+        let parts = entries.enumerated().map { index, entry in
+            """
+            "pr\(index)": {
               "pullRequest": {
-                "number": \(number),
-                "title": "Part \(number)",
-                "url": "https://github.com/acme/widget/pull/\(number)",
+                "number": \(entry.number),
+                "title": "Part \(entry.number)",
+                "url": "https://github.com/acme/widget/pull/\(entry.number)",
                 "author": { "login": "alice" },
                 "updatedAt": "2025-01-01T00:00:00Z",
                 "labels": { "nodes": [] },
                 "isDraft": false,
                 "state": "OPEN",
-                "headRefName": "feature/\(number)",
+                "headRefName": "feature/\(entry.number)",
                 "statusCheckRollup": { "state": "SUCCESS", "contexts": { "nodes": [] } },
                 "mergeable": "MERGEABLE",
                 "mergeStateStatus": "CLEAN",
@@ -632,11 +633,17 @@ struct GitHubServiceBatchIntegrationTests {
                 "latestReviews": { "nodes": [] },
                 "reviewRequests": { "nodes": [] },
                 "stackEntry": {
-                  "position": \(position),
+                  "position": \(entry.position),
                   "stack": { "id": "PRS_stack", "number": 9, "size": 4 }
                 }
               }
             }
+            """
+        }
+        return """
+        {
+          "data": {
+            \(parts.joined(separator: ",\n"))
           }
         }
         """
@@ -663,8 +670,10 @@ struct GitHubServiceBatchIntegrationTests {
         let mock = MockShellExecutor(
             executeResponseMatchers: [
                 ("node(id:", .success(Self.stackEntriesResult)),
-                ("pullRequest(number: 101)", .success(Self.stackPartDetailJSON(number: 101, position: 1))),
-                ("pullRequest(number: 104)", .success(Self.stackPartDetailJSON(number: 104, position: 4))),
+                ("pullRequest(number: 101)", .success(Self.stackPartsDetailResponse([
+                    (number: 101, position: 1),
+                    (number: 104, position: 4),
+                ]))),
             ]
         )
         let service = withDependencies { $0.shellExecutor = mock } operation: { GitHubService() }
@@ -684,6 +693,12 @@ struct GitHubServiceBatchIntegrationTests {
         #expect(completion.missingParts.map { $0.stack?.position } == [1, 4])
         #expect(completion.missingParts.allSatisfy { $0.type == .reviewing })
         #expect(completion.mergedPositions == [3])
+
+        // Both missing parts are fetched by one batched detail call, not one
+        // `gh api graphql` invocation per part.
+        let calls = await mock.executeCalls
+        let detailCalls = calls.filter { $0.arguments.joined(separator: " ").contains("pullRequest(number:") }
+        #expect(detailCalls.count == 1, "missing parts must be fetched in one batched graphql call")
     }
 
     @Test func fetchMissingStackPartsReturnsNothingWhenEveryPartIsKnown() async throws {

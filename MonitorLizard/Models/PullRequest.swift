@@ -67,8 +67,10 @@ struct PullRequest: Identifiable, Hashable, Codable {
     var stack: PRStackInfo?  // nil = not part of a GitHub stack
     /// Whether the authenticated viewer approved this PR, judged by their latest
     /// opinionated review. true = approved, false = not approved (their latest
-    /// opinionated review says otherwise, or they have none), nil = unknown
-    /// (older cached data or a fetch that could not determine it).
+    /// opinionated review says otherwise, or they have none and the returned
+    /// review nodes prove the connection was exhausted), nil = unknown (older
+    /// cached data, no viewer login, an absent review connection, or a full
+    /// review window that may be truncated before the viewer's review).
     var viewerApproved: Bool? = nil
 
     var displayTitle: String { customName ?? title }
@@ -371,18 +373,33 @@ struct BatchPRStatusResponse: Codable {
         )
     }
 
+    /// How many nodes the queries request from `latestOpinionatedReviews`,
+    /// which returns one node per user. When that many nodes come back, the
+    /// window may be truncated, so a viewer absent from it is unknown rather
+    /// than proven to have no opinionated review. The query builders
+    /// interpolate this same value so the request and its interpretation
+    /// cannot drift apart.
+    nonisolated static let reviewConnectionWindow = 20
+
     /// Whether the authenticated viewer approved this PR, judged by their latest
     /// opinionated review (`latestOpinionatedReviews` ignores later comments,
-    /// unlike `viewerLatestReview`). true = approved, false = the viewer's latest
-    /// opinionated review is not an approval, including when they have none;
-    /// nil = unknown (no viewer login, or the `latestOpinionatedReviews`
-    /// connection is absent from the response).
+    /// unlike `viewerLatestReview`). true = approved; false = the viewer's
+    /// latest opinionated review is not an approval, including when they have
+    /// none and the returned nodes prove the connection was exhausted (fewer
+    /// than `reviewConnectionWindow` nodes); nil = unknown (no viewer login, an
+    /// absent `latestOpinionatedReviews` connection, or a full window that may
+    /// be truncated before the viewer's review).
     func viewerApproved(viewerLogin: String?) -> Bool? {
         guard let viewerLogin, let nodes = latestOpinionatedReviews?.nodes else {
             return nil
         }
         guard let viewerState = nodes.first(where: { $0.author?.login == viewerLogin })?.state else {
-            return false
+            // The viewer is absent from the returned nodes. The connection
+            // returns one node per user, newest first, so a full window may be
+            // truncated with the viewer's review pushed off the end; a partial
+            // window means the connection was exhausted and the viewer truly
+            // has no opinionated review.
+            return nodes.count >= Self.reviewConnectionWindow ? nil : false
         }
         return viewerState.uppercased() == "APPROVED"
     }

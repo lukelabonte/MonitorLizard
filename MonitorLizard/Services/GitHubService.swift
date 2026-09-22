@@ -195,7 +195,7 @@ class GitHubService: GitHubServicing, ObservableObject {
                     author { login }
                   }
                 }
-                latestOpinionatedReviews(last: 20) {
+                latestOpinionatedReviews(last: \(BatchPRStatusResponse.reviewConnectionWindow)) {
                   nodes {
                     state
                     author { login }
@@ -217,85 +217,107 @@ class GitHubService: GitHubServicing, ObservableObject {
         return "query {\n\(fragments.joined(separator: "\n"))\nviewer { login }\n}"
     }
 
+    /// Builds a single `gh api graphql` query that fetches the full detail for
+    /// one PR, aliased `pr0` so the response maps back like a batch response.
     nonisolated static func buildPRDetailQuery(for request: PRStatusRequest, includeStackInfo: Bool = true) -> String {
+        buildBatchDetailQuery(for: [request], includeStackInfo: includeStackInfo)
+    }
+
+    /// Builds a single `gh api graphql` query that fetches the full detail for
+    /// all given PRs, each aliased `pr<index>` so the response can be mapped
+    /// back by position. Used to complete stacks: every open part missing from
+    /// the user's lists is fetched in one call instead of one call per part.
+    nonisolated static func buildBatchDetailQuery(for requests: [PRStatusRequest], includeStackInfo: Bool = true) -> String {
+        guard !requests.isEmpty else { return "query {}" }
+
         let stackEntry = includeStackInfo ? stackEntrySelection : ""
-        return """
-        query {
-          pr0: repository(owner: "\(request.owner)", name: "\(request.repo)") {
-            pullRequest(number: \(request.number)) {
-              number
-              title
-              url
-              author { login }
-              updatedAt
-              labels(first: 20) {
-                nodes {
-                  id
-                  name
-                  color
-                }
-              }
-              isDraft
-              state
-              headRefName
-              baseRef {
-                branchProtectionRule {
-                  requiredStatusCheckContexts
-                  requiredStatusChecks {
-                    context
-                  }
-                }
-              }
-              statusCheckRollup {
-                state
-                contexts(last: 100) {
-                  nodes {
-                    ... on CheckRun {
-                      __typename
-                      name
-                      status
-                      conclusion
-                      isRequired(pullRequestNumber: \(request.number))
-                      detailsUrl
-                    }
-                    ... on StatusContext {
-                      __typename
-                      context
-                      state
-                      isRequired(pullRequestNumber: \(request.number))
-                      targetUrl
-                    }
-                  }
-                }
-              }
-              mergeable
-              mergeStateStatus
-              reviewDecision
-              latestReviews(last: 20) {
-                nodes {
-                  state
-                  author { login }
-                }
-              }
-              latestOpinionatedReviews(last: 20) {
-                nodes {
-                  state
-                  author { login }
-                }
-              }
-              reviewRequests(last: 20) {
-                nodes {
-                  requestedReviewer {
-                    ... on User { login }
-                  }
-                }
-              }
+        let fragments = requests.enumerated().map { index, request in
+            """
+            pr\(index): repository(owner: "\(request.owner)", name: "\(request.repo)") {
+              pullRequest(number: \(request.number)) {
+            \(prDetailSelection(for: request))
                 \(stackEntryPlaceholder)
+              }
+            }
+            """.replacingOccurrences(of: stackEntryPlaceholder, with: stackEntry)
+        }
+
+        return "query {\n\(fragments.joined(separator: "\n"))\nviewer { login }\n}"
+    }
+
+    /// The full per-PR node selection for detail queries: everything needed to
+    /// build a `PullRequest` from the response. Shared by the single-PR detail
+    /// query and the batch detail query so the two cannot drift apart.
+    nonisolated private static func prDetailSelection(for request: PRStatusRequest) -> String {
+        """
+        number
+        title
+        url
+        author { login }
+        updatedAt
+        labels(first: 20) {
+          nodes {
+            id
+            name
+            color
+          }
+        }
+        isDraft
+        state
+        headRefName
+        baseRef {
+          branchProtectionRule {
+            requiredStatusCheckContexts
+            requiredStatusChecks {
+              context
             }
           }
-          viewer { login }
         }
-        """.replacingOccurrences(of: stackEntryPlaceholder, with: stackEntry)
+        statusCheckRollup {
+          state
+          contexts(last: 100) {
+            nodes {
+              ... on CheckRun {
+                __typename
+                name
+                status
+                conclusion
+                isRequired(pullRequestNumber: \(request.number))
+                detailsUrl
+              }
+              ... on StatusContext {
+                __typename
+                context
+                state
+                isRequired(pullRequestNumber: \(request.number))
+                targetUrl
+              }
+            }
+          }
+        }
+        mergeable
+        mergeStateStatus
+        reviewDecision
+        latestReviews(last: 20) {
+          nodes {
+            state
+            author { login }
+          }
+        }
+        latestOpinionatedReviews(last: \(BatchPRStatusResponse.reviewConnectionWindow)) {
+          nodes {
+            state
+            author { login }
+          }
+        }
+        reviewRequests(last: 20) {
+          nodes {
+            requestedReviewer {
+              ... on User { login }
+            }
+          }
+        }
+        """
     }
 
     /// Builds the query that lists a stack's parts, used to fill in the parts that
@@ -340,6 +362,30 @@ class GitHubService: GitHubServicing, ObservableObject {
             }
         }
         return result
+    }
+
+    /// Parses a `gh api graphql` batch detail response into the raw
+    /// `BatchPRStatusResponse` per alias plus the authenticated viewer's login.
+    /// Unlike `parseBatchResponse`, nothing is flattened to
+    /// `GHPRDetailResponse`, so callers can build full `PullRequest` values.
+    /// PRs whose `pullRequest` field is null (closed, deleted, or inaccessible)
+    /// are omitted from the returned dictionary.
+    static func parseBatchDetailResponse(
+        _ json: String,
+        requests: [PRStatusRequest]
+    ) throws -> (responses: [PRStatusRequest: BatchPRStatusResponse], viewerLogin: String?) {
+        guard let data = json.data(using: .utf8) else {
+            throw GitHubError.invalidResponse
+        }
+        let response = try JSONDecoder().decode(BatchGraphQLResponse.self, from: data)
+
+        var responses: [PRStatusRequest: BatchPRStatusResponse] = [:]
+        for (index, request) in requests.enumerated() {
+            if let prNode = response.data["pr\(index)"], let prStatus = prNode.pullRequest {
+                responses[request] = prStatus
+            }
+        }
+        return (responses: responses, viewerLogin: response.data.viewerLogin)
     }
 
     /// Fetches PR status data for all given requests in as few `gh api graphql` calls as
@@ -1142,8 +1188,8 @@ class GitHubService: GitHubServicing, ObservableObject {
             return .empty
         }
 
-        var parts: [PullRequest] = []
         var mergedPositions: [Int] = []
+        var missingNumbers: [Int] = []
         for entry in stack.entries.nodes {
             guard let entryPR = entry.pullRequest else { continue }
 
@@ -1156,12 +1202,40 @@ class GitHubService: GitHubServicing, ObservableObject {
             }
 
             guard state == "OPEN", !knownNumbers.contains(entryPR.number) else { continue }
+            missingNumbers.append(entryPR.number)
+        }
 
-            let request = PRStatusRequest(owner: owner, repo: repo, number: entryPR.number)
-            guard let detail = try await fetchPRDetail(for: request, host: host),
+        guard !missingNumbers.isEmpty else {
+            return StackCompletion(missingParts: [], mergedPositions: mergedPositions.sorted())
+        }
+
+        // Fetch every missing part's full detail in as few calls as possible,
+        // chunked like the status batch to stay within GraphQL complexity limits.
+        // Ascending PR number keeps the appended parts in a stable order.
+        let requests = missingNumbers
+            .sorted()
+            .map { PRStatusRequest(owner: owner, repo: repo, number: $0) }
+        var details: [PRStatusRequest: BatchPRStatusResponse] = [:]
+        var viewerLogin: String?
+        let chunks = stride(from: 0, to: requests.count, by: Constants.batchQueryChunkSize)
+            .map { Array(requests[$0..<min($0 + Constants.batchQueryChunkSize, requests.count)]) }
+        for chunk in chunks {
+            let detailJSON = try await executeGraphQL(host: host) { includeStackInfo in
+                GitHubService.buildBatchDetailQuery(for: chunk, includeStackInfo: includeStackInfo)
+            }
+            let parsed = try GitHubService.parseBatchDetailResponse(detailJSON, requests: chunk)
+            details.merge(parsed.responses) { _, new in new }
+            viewerLogin = viewerLogin ?? parsed.viewerLogin
+        }
+
+        var parts: [PullRequest] = []
+        for request in requests {
+            // A part whose node is null (closed, deleted, or inaccessible) or
+            // that no longer reports a stack entry is skipped.
+            guard let response = details[request],
                   let part = try buildPullRequest(
-                      from: detail.response,
-                      viewerLogin: detail.viewerLogin,
+                      from: response,
+                      viewerLogin: viewerLogin,
                       owner: owner,
                       repo: repo,
                       type: type,

@@ -6,6 +6,7 @@ struct GitHubServiceBatchQueryTests {
 
     enum RequiredMetadataQueryScenario: CaseIterable, Sendable {
         case batch
+        case batchDetail
         case detail
 
         var query: String {
@@ -13,6 +14,8 @@ struct GitHubServiceBatchQueryTests {
             switch self {
             case .batch:
                 return GitHubService.buildBatchQuery(for: [request])
+            case .batchDetail:
+                return GitHubService.buildBatchDetailQuery(for: [request])
             case .detail:
                 return GitHubService.buildPRDetailQuery(for: request)
             }
@@ -77,6 +80,8 @@ struct GitHubServiceBatchQueryTests {
         let query = switch scenario {
         case .batch:
             GitHubService.buildBatchQuery(for: [request], includeStackInfo: false)
+        case .batchDetail:
+            GitHubService.buildBatchDetailQuery(for: [request], includeStackInfo: false)
         case .detail:
             GitHubService.buildPRDetailQuery(for: request, includeStackInfo: false)
         }
@@ -87,6 +92,7 @@ struct GitHubServiceBatchQueryTests {
 
     enum ViewerQueryScenario: CaseIterable, Sendable {
         case batch
+        case batchDetail
         case detail
 
         func query(includeStackInfo: Bool) -> String {
@@ -94,6 +100,8 @@ struct GitHubServiceBatchQueryTests {
             switch self {
             case .batch:
                 return GitHubService.buildBatchQuery(for: [request], includeStackInfo: includeStackInfo)
+            case .batchDetail:
+                return GitHubService.buildBatchDetailQuery(for: [request], includeStackInfo: includeStackInfo)
             case .detail:
                 return GitHubService.buildPRDetailQuery(for: request, includeStackInfo: includeStackInfo)
             }
@@ -107,6 +115,16 @@ struct GitHubServiceBatchQueryTests {
         #expect(query.range(of: #"viewer\s*\{\s*login\s*\}"#, options: .regularExpression) != nil)
         #expect(query.contains("latestOpinionatedReviews"))
         #expect(query.range(of: #"latestOpinionatedReviews[^{]*\{\s*nodes"#, options: .regularExpression) != nil)
+    }
+
+    @Test(arguments: ViewerQueryScenario.allCases)
+    func queryRequestsOpinionatedReviewsWithTheSharedWindow(scenario: ViewerQueryScenario) {
+        // The window size must come from the same constant `viewerApproved`
+        // uses to judge truncation, so the request and its interpretation
+        // cannot drift apart.
+        let query = scenario.query(includeStackInfo: true)
+
+        #expect(query.contains("latestOpinionatedReviews(last: \(BatchPRStatusResponse.reviewConnectionWindow))"))
     }
 
     @Test func buildBatchQueryForEmptyListProducesValidQuery() {
@@ -140,5 +158,39 @@ struct GitHubServiceBatchQueryTests {
         for i in 0..<5 {
             #expect(query.contains("pr\(i)"))
         }
+    }
+
+    // MARK: - Batch detail query
+
+    @Test func buildBatchDetailQueryAliasesEveryRequestAndSelectsTheFullDetail() {
+        let requests = [
+            PRStatusRequest(owner: "acme", repo: "widget", number: 101),
+            PRStatusRequest(owner: "acme", repo: "widget", number: 104),
+        ]
+        let query = GitHubService.buildBatchDetailQuery(for: requests)
+
+        #expect(query.contains("pr0: repository(owner: \"acme\", name: \"widget\")"))
+        #expect(query.contains("pr1: repository(owner: \"acme\", name: \"widget\")"))
+        #expect(query.contains("pullRequest(number: 101)"))
+        #expect(query.contains("pullRequest(number: 104)"))
+        // The full detail selection, so a PullRequest can be built per part.
+        for field in [
+            "number", "title", "url", "author { login }", "updatedAt", "labels(first: 20)",
+            "isDraft", "state", "headRefName", "baseRef", "branchProtectionRule",
+            "statusCheckRollup", "mergeable", "mergeStateStatus", "reviewDecision",
+            "latestReviews", "latestOpinionatedReviews", "reviewRequests",
+        ] {
+            #expect(query.contains(field), "missing field: \(field)")
+        }
+        #expect(query.range(of: #"viewer\s*\{\s*login\s*\}"#, options: .regularExpression) != nil)
+    }
+
+    @Test func buildPRDetailQueryDelegatesToTheBatchDetailBuilder() {
+        let request = PRStatusRequest(owner: "alice", repo: "repo", number: 42)
+
+        #expect(GitHubService.buildPRDetailQuery(for: request)
+            == GitHubService.buildBatchDetailQuery(for: [request]))
+        #expect(GitHubService.buildPRDetailQuery(for: request, includeStackInfo: false)
+            == GitHubService.buildBatchDetailQuery(for: [request], includeStackInfo: false))
     }
 }

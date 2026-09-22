@@ -373,4 +373,109 @@ struct GitHubServiceBatchResponseParsingTests {
 
         #expect(result[request]?.viewerApproved == false)
     }
+
+    // MARK: - Review window truncation
+
+    /// Builds `count` opinionated review nodes from users other than the viewer.
+    private static func otherReviewerNodes(_ count: Int) -> String {
+        (1...count).map { index in
+            "{ \"state\": \"APPROVED\", \"author\": { \"login\": \"reviewer-\(index)\" } }"
+        }.joined(separator: ", ")
+    }
+
+    @Test func parseBatchResponseReportsNilWhenAFullWindowOmitsTheViewer() throws {
+        // `latestOpinionatedReviews(last:)` returns one node per user, newest
+        // first, so a full window may be truncated with the viewer's review
+        // pushed off the end. Their absence is unknown, not "no approval".
+        let window = BatchPRStatusResponse.reviewConnectionWindow
+        let json = Self.makeViewerResponse(
+            viewerJSON: "{ \"login\": \"luke\" }",
+            opinionatedReviewNodes: Self.otherReviewerNodes(window)
+        )
+        let request = PRStatusRequest(owner: "owner", repo: "repo", number: 1)
+
+        let result = try GitHubService.parseBatchResponse(json, requests: [request])
+
+        #expect(result[request]?.viewerApproved == nil)
+    }
+
+    @Test func parseBatchResponseReportsFalseWhenAPartialWindowOmitsTheViewer() throws {
+        // Fewer nodes than the requested window means the connection was
+        // exhausted, so the viewer truly has no opinionated review.
+        let window = BatchPRStatusResponse.reviewConnectionWindow
+        let json = Self.makeViewerResponse(
+            viewerJSON: "{ \"login\": \"luke\" }",
+            opinionatedReviewNodes: Self.otherReviewerNodes(window - 1)
+        )
+        let request = PRStatusRequest(owner: "owner", repo: "repo", number: 1)
+
+        let result = try GitHubService.parseBatchResponse(json, requests: [request])
+
+        #expect(result[request]?.viewerApproved == false)
+    }
+
+    @Test func parseBatchResponseReportsTrueWhenTheViewerIsInsideAFullWindow() throws {
+        let window = BatchPRStatusResponse.reviewConnectionWindow
+        let nodes = Self.otherReviewerNodes(window - 1)
+            + ", { \"state\": \"APPROVED\", \"author\": { \"login\": \"luke\" } }"
+        let json = Self.makeViewerResponse(
+            viewerJSON: "{ \"login\": \"luke\" }",
+            opinionatedReviewNodes: nodes
+        )
+        let request = PRStatusRequest(owner: "owner", repo: "repo", number: 1)
+
+        let result = try GitHubService.parseBatchResponse(json, requests: [request])
+
+        #expect(result[request]?.viewerApproved == true)
+    }
+
+    // MARK: - Batch detail parsing
+
+    @Test func parseBatchDetailResponseKeepsTheFieldsNeededToBuildAPullRequest() throws {
+        let json = """
+        {
+          "data": {
+            "viewer": { "login": "luke" },
+            "pr0": {
+              "pullRequest": {
+                "number": 101,
+                "title": "Part 101",
+                "url": "https://github.com/acme/widget/pull/101",
+                "author": { "login": "alice" },
+                "updatedAt": "2025-01-01T00:00:00Z",
+                "labels": { "nodes": [] },
+                "isDraft": true,
+                "state": "OPEN",
+                "headRefName": "feature/101",
+                "statusCheckRollup": { "state": "SUCCESS", "contexts": { "nodes": [] } },
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "reviewDecision": null,
+                "latestReviews": { "nodes": [] },
+                "latestOpinionatedReviews": { "nodes": [] },
+                "reviewRequests": { "nodes": [] },
+                "stackEntry": {
+                  "position": 1,
+                  "stack": { "id": "PRS_stack", "number": 9, "size": 4 }
+                }
+              }
+            },
+            "pr1": { "pullRequest": null }
+          }
+        }
+        """
+        let req0 = PRStatusRequest(owner: "acme", repo: "widget", number: 101)
+        let req1 = PRStatusRequest(owner: "acme", repo: "widget", number: 104)
+
+        let parsed = try GitHubService.parseBatchDetailResponse(json, requests: [req0, req1])
+
+        #expect(parsed.viewerLogin == "luke")
+        #expect(parsed.responses[req1] == nil, "a null pullRequest is omitted")
+        let response = try #require(parsed.responses[req0])
+        #expect(response.number == 101)
+        #expect(response.title == "Part 101")
+        #expect(response.isDraft == true)
+        #expect(response.state == "OPEN")
+        #expect(response.stackEntry?.stackInfo == PRStackInfo(id: "PRS_stack", number: 9, size: 4, position: 1))
+    }
 }

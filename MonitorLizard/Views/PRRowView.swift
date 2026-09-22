@@ -249,12 +249,22 @@ struct PRRowView: View {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 10))
                         .foregroundColor(.orange)
-                        .help("Blocks the rest of the stack from advancing")
+                        .help(context.blockingReason.map { reason in
+                            "Blocks the rest of the stack from advancing — \(reason)"
+                        } ?? "Blocks the rest of the stack from advancing")
                 }
 
                 Text("#\(pr.number, format: .number.grouping(.never))")
                     .font(.caption)
                     .foregroundColor(.secondary)
+
+                // Companions are someone else's PRs fetched to complete a stack,
+                // so the row shows who authored them.
+                if viewModel.isStackCompanion(pr) {
+                    Text("@\(pr.author.login)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
 
                 Text(pr.displayTitle)
                     .font(.subheadline)
