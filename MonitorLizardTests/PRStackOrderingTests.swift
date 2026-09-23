@@ -167,6 +167,19 @@ struct PRStackOrderingTests {
         #expect(header(rows)?.size == 4)
     }
 
+    @Test func collapsedUnknownStackNamesOnlyItsVisibleBlocker() {
+        let rows = PRStackOrdering.rows(from: [
+            makePR(3, position: 3, status: .failure, mergedPositions: [1]),
+        ], collapsedStackIDs: ["stack-1"])
+
+        #expect(rows.count == 1)
+        let header = header(rows)
+        #expect(header?.readiness.status == .unknown)
+        #expect(header?.startPart == nil)
+        #expect(header?.summary == "Part 1 merged · 1 of 4 parts in your lists · Visible part 3 (#3) blocked — failing checks")
+        #expect(header?.helpText == "Stack #7 — 4 parts. Visible here: #3 (3/4). Part 1 merged. Readiness unknown; visible part 3 of 4 (#3) is blocked (failing checks).")
+    }
+
     @Test func marksOnlyTheBlockingPart() {
         let rows = PRStackOrdering.rows(from: [
             makePR(1, position: 1, status: .failure),
@@ -338,6 +351,32 @@ struct PRStackReadinessTests {
         #expect(readiness.blockingPart == .init(position: 2, number: 2, reason: "changes requested"))
     }
 
+    @Test func reviewRequiredOnTheLowestPartBlocksTheStack() {
+        // Review required blocks merging just like changes requested: a
+        // green-check part still waiting on a review cannot advance the stack.
+        let readiness = PRStackOrdering.readiness(
+            of: [makePR(1, position: 1, stackSize: 2, reviewDecision: .reviewRequired)],
+            stackSize: 2
+        )
+
+        #expect(readiness.status == .blocked(.init(position: 1, number: 1, reason: "review required")))
+        #expect(!readiness.isReadyToAdvance)
+    }
+
+    @Test func readyBaseWithReviewRequiredOnAnUpperPartIsReadyToAdvance() {
+        let readiness = PRStackOrdering.readiness(
+            of: [
+                makePR(1, position: 1, stackSize: 2),
+                makePR(2, position: 2, stackSize: 2, reviewDecision: .reviewRequired),
+            ],
+            stackSize: 2
+        )
+
+        #expect(readiness.status == .readyToAdvance)
+        #expect(readiness.isReadyToAdvance)
+        #expect(readiness.blockingPart == .init(position: 2, number: 2, reason: "review required"))
+    }
+
     // MARK: - Drafts count as blocked
 
     @Test func draftLowestPartBlocksTheStack() {
@@ -366,7 +405,7 @@ struct PRStackReadinessTests {
         )
 
         #expect(readiness.status == .readyToAdvance)
-        #expect(readiness.blockingPart?.reason == "draft")
+        #expect(readiness.blockingPart == .init(position: 2, number: 2, reason: "draft"))
     }
 
     @Test func draftReasonWinsWhenChecksAlsoFail() {
@@ -500,6 +539,40 @@ struct PRStackReadinessTests {
         #expect(!readiness.isReadyToAdvance)
         #expect(readiness.blockingPart == .init(position: 3, number: 3, reason: "failing checks"))
     }
+
+    @Test func blockedLowestVisiblePartWithoutVisibleBaseIsUnknownButStillNamesTheBlocker() {
+        // The lowest visible part is blocked, but position 1 is neither visible
+        // nor known-merged, so the stack's true lowest part is unknown and
+        // readiness cannot be judged. The blocked part stays exposed so its row
+        // keeps the blocking marker, and the stack must not read as ready.
+        let readiness = PRStackOrdering.readiness(
+            of: [
+                makePR(2, position: 2, stackSize: 4, status: .failure),
+                makePR(3, position: 3, stackSize: 4),
+            ],
+            stackSize: 4
+        )
+
+        #expect(readiness.status == .unknown)
+        #expect(!readiness.isReadyToAdvance)
+        #expect(readiness.blockingPart == .init(position: 2, number: 2, reason: "failing checks"))
+    }
+
+    @Test func unknownMiddlePositionStillMarksABlockedVisibleRow() {
+        let rows = PRStackOrdering.rows(from: [
+            makePR(3, position: 3, stackSize: 4, status: .failure, mergedPositions: [1]),
+        ])
+
+        guard case .stackHeader(let header) = rows.first,
+              case .pr(_, let context) = rows.last else {
+            Issue.record("Expected a stack header and its visible part")
+            return
+        }
+        #expect(header.readiness.status == .unknown)
+        #expect(header.readiness.blockingPart == .init(position: 3, number: 3, reason: "failing checks"))
+        #expect(context?.isBlocking == true)
+        #expect(context?.blockingReason == "failing checks")
+    }
 }
 
 @MainActor
@@ -578,16 +651,43 @@ struct PRStackReadinessTransitionTests {
     }
 
     @Test func doesNotNameTheNextPartWhenAMiddlePositionIsUnknown() {
-        // Position 1 has merged and position 3 is ready, but position 2 is
-        // neither visible nor known-merged, so the part to merge next cannot be
-        // named: part 3 might not be reachable yet.
+        // Position 1 has merged and position 3 is green, but position 2 is
+        // neither visible nor known-merged: the next position to merge is
+        // unknown, so the stack is not ready to advance and must not notify.
         let prs = [makePR(3, position: 3, status: .success, stackSize: 4, mergedPositions: [1])]
+
+        let result = PRStackOrdering.readinessTransitions(previouslyReady: [], prs: prs)
+
+        #expect(result.newlyReady.isEmpty, "a stack whose next position is unknown must not be reported ready")
+        #expect(result.readyStackIDs.isEmpty)
+
+        // Direct readiness: the unaccounted merge frontier keeps the stack from
+        // reading as ready to advance, and nothing visible is blocked.
+        let readiness = PRStackOrdering.readiness(of: prs, stackSize: 4)
+        #expect(readiness.status == .unknown)
+        #expect(!readiness.isReadyToAdvance)
+        #expect(readiness.blockingPart == nil, "part 3 is green, so no visible part is the blocker")
+    }
+
+    @Test func readyBaseAdvancesEvenWhenAHigherPositionIsUnknown() {
+        // Part 1 is visible and ready and part 3 is green, but part 2 is neither
+        // visible nor known-merged. The unknown position sits above the merge
+        // frontier (part 1 has not merged yet), so it must not hold the stack
+        // back: the stack reports ready, advancing via part 1.
+        let prs = [
+            makePR(1, position: 1, status: .success, stackSize: 4),
+            makePR(3, position: 3, status: .success, stackSize: 4),
+        ]
 
         let result = PRStackOrdering.readinessTransitions(previouslyReady: [], prs: prs)
 
         #expect(result.newlyReady.count == 1)
         #expect(result.newlyReady.first?.allReady == false)
-        #expect(result.newlyReady.first?.nextPartPosition == nil)
+        #expect(result.newlyReady.first?.nextPartPosition == 1)
+
+        let readiness = PRStackOrdering.readiness(of: prs, stackSize: 4)
+        #expect(readiness.status == .readyToAdvance)
+        #expect(readiness.isReadyToAdvance)
     }
 
     @Test func reportsASingleStackAcrossMultipleParts() {
@@ -705,18 +805,19 @@ struct StackReadyNotificationContentTests {
         #expect(content.body == "Part 2 of 3 is ready to merge.")
     }
 
-    @Test func stackWithoutANamableNextPartFallsBack() {
+    @Test func stackWithoutANamableNextPartDoesNotClaimReadiness() {
         let stack = ReadyStack(
             id: "ST_1",
             number: 7,
             size: 4,
             allReady: false,
             nextPartPosition: nil,
-            landedPositions: []
+            landedPositions: [1]
         )
 
         let content = NotificationService.stackReadyContent(for: stack)
 
-        #expect(content.body == "The next part of 4 is ready to merge.")
+        #expect(content.title == "Stack status unknown")
+        #expect(content.body == "The next part to merge could not be determined.")
     }
 }

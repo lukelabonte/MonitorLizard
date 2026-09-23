@@ -92,18 +92,22 @@ final class NotificationService: NotificationServicing, @unchecked Sendable {
     nonisolated static func stackReadyContent(
         for stack: ReadyStack
     ) -> (title: String, subtitle: String, body: String, identifier: String) {
+        let title: String
         let body: String
         if stack.allReady {
+            title = "✅ Stack ready"
             body = stack.landedPositions.isEmpty
                 ? "All \(stack.size) pull requests in this stack are ready to merge."
                 : "All remaining parts are ready to merge."
         } else if let nextPartPosition = stack.nextPartPosition {
+            title = "✅ Stack ready"
             body = "Part \(nextPartPosition) of \(stack.size) is ready to merge."
         } else {
-            body = "The next part of \(stack.size) is ready to merge."
+            title = "Stack status unknown"
+            body = "The next part to merge could not be determined."
         }
         return (
-            title: "✅ Stack ready",
+            title: title,
             subtitle: "Stack #\(stack.number)",
             body: body,
             identifier: "stack-\(stack.id)"

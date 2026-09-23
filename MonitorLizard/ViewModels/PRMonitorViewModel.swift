@@ -56,7 +56,7 @@ class PRMonitorViewModel: ObservableObject {
     /// Completed stacks for this session, keyed by stack id, so a poll that
     /// still shows the same visible parts reuses the earlier lookup.
     private var stackResolutionCache: [String: StackResolutionCacheEntry] = [:]
-    /// Stack parts removed this session, by PR id. Completion would otherwise
+    /// Stack parts the user removed, by PR id. Completion would otherwise
     /// re-add them as companions for as long as a sibling anchor stays in a list.
     private var removedStackPartIDs: Set<String> = []
     /// Stack parts currently in the lists only because completion added them,
@@ -71,7 +71,10 @@ class PRMonitorViewModel: ObservableObject {
     var copyClearTask: Task<Void, Never>? { copiedPRLinkTask }
 
     var selectedRepository: String {
-        get { defaults.string(forKey: PreferenceKeys.selectedRepository) ?? "All Repositories" }
+        get {
+            let selected = defaults.string(forKey: PreferenceKeys.selectedRepository) ?? "All Repositories"
+            return availableRepositories.first { $0.lowercased() == selected.lowercased() } ?? selected
+        }
         set {
             defaults.set(newValue, forKey: PreferenceKeys.selectedRepository)
             objectWillChange.send()
@@ -110,20 +113,27 @@ class PRMonitorViewModel: ObservableObject {
     }
 
     var availableRepositories: [String] {
-        let mainRepos = Set(unsortedPullRequests.map { $0.repository.nameWithOwner })
-        let otherRepos = Set(otherPullRequests.map { $0.repository.nameWithOwner })
-        return mainRepos.union(otherRepos).sorted()
+        var namesByRepository: [String: String] = [:]
+        for pr in unsortedPullRequests + otherPullRequests {
+            let name = pr.repository.nameWithOwner
+            let normalizedName = name.lowercased()
+            if namesByRepository[normalizedName] == nil {
+                namesByRepository[normalizedName] = name
+            }
+        }
+        return namesByRepository.values.sorted()
     }
 
     var reposWithIssues: Set<String> {
         let allPRs = unsortedPullRequests + otherPullRequests
         let visiblePRs = hideInactivePRs ? allPRs.filter { !isInactiveByAge($0) } : allPRs
+        let displayNames = Dictionary(uniqueKeysWithValues: availableRepositories.map { ($0.lowercased(), $0) })
         return Set(visiblePRs.compactMap { pr -> String? in
             let badBuild = pr.buildStatus == .failure || pr.buildStatus == .error
                 || pr.buildStatus == .conflict || pr.buildStatus == .notStarted
                 || pr.buildStatus == .inactive
             guard badBuild || pr.reviewDecision == .changesRequested else { return nil }
-            return pr.repository.nameWithOwner
+            return displayNames[pr.repository.nameWithOwner.lowercased()]
         })
     }
 
@@ -146,21 +156,32 @@ class PRMonitorViewModel: ObservableObject {
     }
 
     private func sectionPRs(for type: PRType) -> [PullRequest] {
-        switch type {
-        case .reviewing:
-            guard showReviewPRs else { return [] }
-            return pullRequests.filter { $0.type == .reviewing && matchesSelectedRepository($0) }
-        case .authored:
-            let prs = pullRequests.filter { $0.type == .authored && matchesSelectedRepository($0) }
-            return hideInactivePRs ? prs.filter { !isInactiveByAge($0) } : prs
-        case .other:
-            let prs = otherPullRequests.filter(matchesSelectedRepository)
-            return hideInactivePRs ? prs.filter { !isInactiveByAge($0) } : prs
+        // A stack may span Authored, Reviewing, and pinned Other. Render all
+        // visible members together under the lowest-position member's category.
+        let visible = (pullRequests + otherPullRequests).filter { pr in
+            guard matchesSelectedRepository(pr) else { return false }
+            switch pr.type {
+            case .reviewing: return showReviewPRs
+            case .authored: return !hideInactivePRs || !isInactiveByAge(pr)
+            case .other: return !hideInactivePRs || !isInactiveByAge(pr)
+            }
+        }
+        var lowestByStack: [String: PullRequest] = [:]
+        for pr in visible {
+            guard let stack = pr.stack else { continue }
+            if stack.position < (lowestByStack[stack.id]?.stack?.position ?? Int.max) {
+                lowestByStack[stack.id] = pr
+            }
+        }
+        return visible.filter { pr in
+            guard let stack = pr.stack else { return pr.type == type }
+            return lowestByStack[stack.id]?.type == type
         }
     }
 
     private func matchesSelectedRepository(_ pr: PullRequest) -> Bool {
-        selectedRepository == "All Repositories" || pr.repository.nameWithOwner == selectedRepository
+        selectedRepository == "All Repositories"
+            || pr.repository.nameWithOwner.lowercased() == selectedRepository.lowercased()
     }
 
     private func isInactiveByAge(_ pr: PullRequest) -> Bool {
@@ -176,6 +197,7 @@ class PRMonitorViewModel: ObservableObject {
         self.isDemoMode = isDemoMode
         self.stackResolutionTTL = stackResolutionTTL
         readyStackIDs = loadNotifiedReadyStackIDs()
+        removedStackPartIDs = loadRemovedStackPartIDs()
         restoreFromCache()
         setupNotifications()
         startPolling()
@@ -190,14 +212,14 @@ class PRMonitorViewModel: ObservableObject {
     }
 
     private func restoreFromCache() {
-        let cached = cacheService.loadMainPRs()
+        let cached = cacheService.loadMainPRs().filter { !removedStackPartIDs.contains($0.id.lowercased()) }
         if !cached.isEmpty {
             unsortedPullRequests = cached.map {
                 var pr = $0; pr.isWatched = watchlistService.isWatched(pr); return pr
             }
             applySorting()
         }
-        otherPullRequests = cacheService.loadOtherPRs().map {
+        otherPullRequests = cacheService.loadOtherPRs().filter { !removedStackPartIDs.contains($0.id.lowercased()) }.map {
             var pr = $0; pr.isWatched = watchlistService.isWatched(pr); return pr
         }
     }
@@ -244,7 +266,9 @@ class PRMonitorViewModel: ObservableObject {
     }
 
     func refresh() async {
+        guard !isLoading else { return }
         isLoading = true
+        defer { isLoading = false }
         errorMessage = nil
 
         async let mainFetchTask = githubService.fetchAllOpenPRs(
@@ -259,10 +283,12 @@ class PRMonitorViewModel: ObservableObject {
             let fetchedOther = await otherFetchTask
             let fetchedPRs = fetchResult.pullRequests
 
-            let otherIDs = Set(fetchedOther.map { $0.id })
-            let dedupedPRs = fetchedPRs.filter { !otherIDs.contains($0.id) }
+            let otherIDs = Set(fetchedOther.map { $0.id.lowercased() })
+            let dedupedPRs = fetchedPRs.filter { !otherIDs.contains($0.id.lowercased()) }
 
-            let (mainPRs, otherPRs) = await completeStacks(mainPRs: dedupedPRs, otherPRs: fetchedOther)
+            let completedStacks = await completeStacks(mainPRs: dedupedPRs, otherPRs: fetchedOther)
+            let mainPRs = completedStacks.main
+            let otherPRs = completedStacks.other
 
             let completed = watchlistService.checkForCompletions(currentPRs: mainPRs + otherPRs)
 
@@ -292,13 +318,13 @@ class PRMonitorViewModel: ObservableObject {
             // re-notify on the next full refresh. Defer the evaluation to the next
             // full refresh instead.
             if !fetchResult.isPartial {
-                notifyReadyStacks(allPRs: mainPRs + otherPRs)
+                notifyReadyStacks(allPRs: mainPRs + otherPRs, excluding: completedStacks.unverifiedStackIDs)
             }
 
             if !fetchResult.isPartial &&
                 selectedRepository != "All Repositories" &&
-                !unsortedPullRequests.contains(where: { $0.repository.nameWithOwner == selectedRepository }) &&
-                !otherPullRequests.contains(where: { $0.repository.nameWithOwner == selectedRepository }) {
+                !unsortedPullRequests.contains(where: matchesSelectedRepository) &&
+                !otherPullRequests.contains(where: matchesSelectedRepository) {
                 selectedRepository = "All Repositories"
             }
 
@@ -348,7 +374,6 @@ class PRMonitorViewModel: ObservableObject {
             })
         }
 
-        isLoading = false
     }
 
     private func fetchAllOtherPRs() async -> [PullRequest] {
@@ -393,19 +418,19 @@ class PRMonitorViewModel: ObservableObject {
 
     /// Fetches the parts of any incomplete stack so a stack renders as a whole even
     /// when only one of its PRs matched the user's searches. Companions join the
-    /// section of the stack's first anchor and share its type, and are marked as
-    /// companions (`isStackCompanion`) so their rows can show they are someone
-    /// else's PR rather than something from the user's own lists.
+    /// anchor's list and are marked (`isStackCompanion`) so their rows can show
+    /// they are someone else's PR rather than something from the user's own lists.
     ///
     /// Resolutions are cached per stack for the session: while the fetch keeps
     /// showing the same visible parts and the revalidation interval has not
-    /// elapsed, the earlier lookup is reused instead of refetched. Parts the user
-    /// removed this session are never re-added.
+    /// elapsed, the earlier lookup is reused instead of refetched. A failed
+    /// lookup can reuse previously displayed parts without caching the failure.
+    /// Parts the user removed are never re-added as companions.
     private func completeStacks(
         mainPRs: [PullRequest],
         otherPRs: [PullRequest]
-    ) async -> (main: [PullRequest], other: [PullRequest]) {
-        guard !isDemoMode else { return (mainPRs, otherPRs) }
+    ) async -> (main: [PullRequest], other: [PullRequest], unverifiedStackIDs: Set<String>) {
+        guard !isDemoMode else { return (mainPRs, otherPRs, []) }
 
         // Collected locally and published once at the end, so the marks on the
         // still-displayed lists never flicker off while this function is
@@ -414,7 +439,18 @@ class PRMonitorViewModel: ObservableObject {
         // search, merged, or closed) loses its marking on the same refresh.
         var companionIDs: Set<String> = []
 
-        let knownIDs = Set((mainPRs + otherPRs).map(\.id))
+        let knownIDs = Set((mainPRs + otherPRs).map { $0.id.lowercased() })
+        let fetchedStackIDs = Set((mainPRs + otherPRs).compactMap { $0.stack?.id })
+        // On launch the PR cache has the displayed parts, but not this session's
+        // companion marks. Identify cached parts absent from the current search
+        // before awaiting completion, so they can still be pinned while it runs.
+        stackCompanionIDs.formUnion((unsortedPullRequests + otherPullRequests).filter { pr in
+            guard let stackID = pr.stack?.id else { return false }
+            return fetchedStackIDs.contains(stackID)
+                && !knownIDs.contains(pr.id.lowercased())
+                && !removedStackPartIDs.contains(pr.id.lowercased())
+                && !isPinnedPR(pr)
+        }.map(\.id))
         var knownNumbers: [String: Set<Int>] = [:]
         for pr in mainPRs + otherPRs {
             guard let stack = pr.stack else { continue }
@@ -424,6 +460,7 @@ class PRMonitorViewModel: ObservableObject {
         var main = mainPRs
         var other = otherPRs
         var visitedStacks: Set<String> = []
+        var unverifiedStackIDs: Set<String> = []
 
         for anchor in mainPRs + otherPRs {
             guard let stack = anchor.stack,
@@ -432,34 +469,52 @@ class PRMonitorViewModel: ObservableObject {
                   numbers.count < stack.size else { continue }
 
             let completion: StackCompletion
-            if let cached = stackResolutionCache[stack.id],
-               cached.visibleNumbers == numbers,
+            let cached = stackResolutionCache[stack.id]
+            if let cached, cached.visibleNumbers == numbers,
                Date().timeIntervalSince(cached.resolvedAt) < stackResolutionTTL {
                 // The fetch shows the same parts as when this stack was resolved,
                 // so reuse the earlier lookup instead of another round trip.
+                // Its companion status is not fresh enough for a notification.
+                unverifiedStackIDs.insert(stack.id)
                 completion = StackCompletion(
                     missingParts: cached.companionParts,
                     mergedPositions: cached.mergedPositions
                 )
             } else {
-                // A nil completion means the lookup failed; nothing is cached so
-                // the next poll retries it.
-                guard let resolved = await missingParts(for: anchor, stack: stack, knownNumbers: numbers) else {
+                if let resolved = await missingParts(for: anchor, stack: stack, knownNumbers: numbers) {
+                    completion = resolved
+                    stackResolutionCache[stack.id] = StackResolutionCacheEntry(
+                        visibleNumbers: numbers,
+                        companionParts: resolved.missingParts,
+                        mergedPositions: resolved.mergedPositions,
+                        resolvedAt: Date()
+                    )
+                } else if let cached {
+                    // Revalidation failed: keep this stack's earlier companions
+                    // for this refresh, but leave the cache timestamp untouched
+                    // so the next poll retries the lookup.
+                    unverifiedStackIDs.insert(stack.id)
+                    completion = StackCompletion(
+                        missingParts: cached.companionParts,
+                        mergedPositions: cached.mergedPositions
+                    )
+                } else if let displayed = displayedCompletion(for: stack, knownIDs: knownIDs) {
+                    // A new VM has no resolution cache, but its restored PR lists
+                    // may still hold companions from the previous session.
+                    unverifiedStackIDs.insert(stack.id)
+                    completion = displayed
+                } else {
+                    unverifiedStackIDs.insert(stack.id)
                     continue
                 }
-                completion = resolved
-                stackResolutionCache[stack.id] = StackResolutionCacheEntry(
-                    visibleNumbers: numbers,
-                    companionParts: resolved.missingParts,
-                    mergedPositions: resolved.mergedPositions,
-                    resolvedAt: Date()
-                )
             }
 
             // Exclusions are stored lowercased (see removeOtherPR), so compare the
             // companion's id lowercased as well.
             let parts = completion.missingParts.filter {
-                !knownIDs.contains($0.id) && !removedStackPartIDs.contains($0.id.lowercased())
+                !knownIDs.contains($0.id.lowercased())
+                    && !removedStackPartIDs.contains($0.id.lowercased())
+                    && !isPinnedPR($0)
             }
             companionIDs.formUnion(parts.map(\.id))
 
@@ -479,10 +534,33 @@ class PRMonitorViewModel: ObservableObject {
             }
         }
 
+        // Adding a pin can finish while a stack lookup is suspended. The Other
+        // fetch then predates the new pin; keep that live pin and remove any
+        // duplicate companion from the main-list result before publishing.
+        let currentPinned = otherPullRequests.filter { $0.stack != nil && isPinnedPR($0) }
+        let pinnedIDs = Set(currentPinned.map { $0.id.lowercased() })
+        main.removeAll { pinnedIDs.contains($0.id.lowercased()) }
+        other.removeAll { removedStackPartIDs.contains($0.id.lowercased()) && !isPinnedPR($0) }
+        let otherIDs = Set(other.map { $0.id.lowercased() })
+        let retainedPins = currentPinned.filter { !otherIDs.contains($0.id.lowercased()) }
+        // These pins came from the displayed list rather than this refresh's
+        // Other fetch, so their status is not verified either.
+        unverifiedStackIDs.formUnion(retainedPins.compactMap { $0.stack?.id })
+        other.append(contentsOf: retainedPins)
+
         // Publish the rebuilt companion marks in one step, after every network
         // await in this function has resolved.
         stackCompanionIDs = companionIDs
-        return (main, other)
+        return (main, other, unverifiedStackIDs)
+    }
+
+    private func displayedCompletion(for stack: PRStackInfo, knownIDs: Set<String>) -> StackCompletion? {
+        let displayed = (unsortedPullRequests + otherPullRequests).filter { $0.stack?.id == stack.id }
+        guard !displayed.isEmpty else { return nil }
+        return StackCompletion(
+            missingParts: displayed.filter { !knownIDs.contains($0.id.lowercased()) && !isPinnedPR($0) },
+            mergedPositions: displayed.compactMap { $0.stack?.mergedPositions }.first ?? []
+        )
     }
 
     /// Resolves the missing parts of a stack, or nil when the lookup failed. A
@@ -508,8 +586,8 @@ class PRMonitorViewModel: ObservableObject {
                 inactiveThresholdDays: inactiveBranchThresholdDays
             )
         } catch {
-            // Completing a stack is best-effort; a failure leaves the stack
-            // partial and is retried on the next poll.
+            // Completing a stack is best-effort; the caller can reuse a prior
+            // resolution for this refresh, and retries on the next poll.
             print("Transient error completing stack #\(stack.number): \(error)")
             return nil
         }
@@ -552,9 +630,10 @@ class PRMonitorViewModel: ObservableObject {
             throw OtherPRError.alreadyAdded
         }
         let normalizedRepo = "\(id.owner)/\(id.repo)".lowercased()
-        guard !unsortedPullRequests.contains(where: { pr in
+        func matchesPR(_ pr: PullRequest) -> Bool {
             pr.number == id.number && pr.repository.nameWithOwner.lowercased() == normalizedRepo
-        }) else {
+        }
+        guard !unsortedPullRequests.contains(where: { matchesPR($0) && !isStackCompanion($0) }) else {
             throw OtherPRError.alreadyTracked
         }
         guard let pr = try await githubService.fetchOtherPR(
@@ -565,15 +644,17 @@ class PRMonitorViewModel: ObservableObject {
             throw OtherPRError.notFound
         }
         otherPRsService.add(id)
-        // Re-adding a part revokes the session exclusion an earlier removal
-        // recorded, so stack completion is not permanently blocked for it.
-        removedStackPartIDs.remove(pr.id.lowercased())
+        // Re-adding a part revokes the persisted exclusion from an earlier removal.
+        if removedStackPartIDs.remove(pr.id.lowercased()) != nil {
+            saveRemovedStackPartIDs()
+        }
         var updated = pr
         updated.isWatched = watchlistService.isWatched(pr)
         updated.customName = customNamesService.name(for: pr.id)
+        otherPullRequests.removeAll(where: matchesPR)
         otherPullRequests.append(updated)
-        unsortedPullRequests.removeAll { $0.id == pr.id }
-        pullRequests.removeAll { $0.id == pr.id }
+        unsortedPullRequests.removeAll(where: matchesPR)
+        pullRequests.removeAll(where: matchesPR)
         applySorting()
     }
 
@@ -613,8 +694,8 @@ class PRMonitorViewModel: ObservableObject {
         // Exclusions are lowercased because a pinned part's id casing comes from
         // the URL the user typed, while completion rebuilds companions with the
         // anchor's API-canonical casing.
-        if pr.stack != nil {
-            removedStackPartIDs.insert(pr.id.lowercased())
+        if pr.stack != nil, removedStackPartIDs.insert(pr.id.lowercased()).inserted {
+            saveRemovedStackPartIDs()
         }
         otherPullRequests.removeAll { $0.id == pr.id }
         applySorting()
@@ -736,13 +817,19 @@ class PRMonitorViewModel: ObservableObject {
 
     /// Notifies once per watched stack when it is ready to merge. A stack that
     /// becomes ready before anyone watches it stays pending, so watching it later
-    /// still produces the notification on the next refresh. The ids of stacks
+    /// still produces the notification on the next verified refresh. The ids of stacks
     /// already notified ready persist across launches; a stack that regresses is
     /// dropped from them so its recovery notifies again.
-    private func notifyReadyStacks(allPRs: [PullRequest]) {
+    private func notifyReadyStacks(allPRs: [PullRequest], excluding unverifiedStackIDs: Set<String>) {
         let previouslyReady = readyStackIDs
-        let transition = PRStackOrdering.readinessTransitions(previouslyReady: readyStackIDs, prs: allPRs)
-        readyStackIDs = transition.readyStackIDs
+        let verifiedPRs = allPRs.filter { pr in
+            guard let stackID = pr.stack?.id else { return true }
+            return !unverifiedStackIDs.contains(stackID)
+        }
+        let transition = PRStackOrdering.readinessTransitions(previouslyReady: previouslyReady, prs: verifiedPRs)
+        // An unverified stack is neither newly ready nor known to have regressed.
+        // Keep its previous membership until a successful lookup can decide.
+        readyStackIDs = transition.readyStackIDs.union(previouslyReady.intersection(unverifiedStackIDs))
 
         for readyStack in transition.newlyReady {
             let hasWatchedMember = allPRs.contains {
@@ -773,6 +860,20 @@ class PRMonitorViewModel: ObservableObject {
     private func saveNotifiedReadyStackIDs(_ ids: Set<String>) {
         if let data = try? JSONEncoder().encode(ids.sorted()) {
             defaults.set(data, forKey: PreferenceKeys.notifiedReadyStacks)
+        }
+    }
+
+    private func loadRemovedStackPartIDs() -> Set<String> {
+        guard let data = defaults.data(forKey: PreferenceKeys.removedStackPartIDs),
+              let ids = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(ids.map { $0.lowercased() })
+    }
+
+    private func saveRemovedStackPartIDs() {
+        if let data = try? JSONEncoder().encode(removedStackPartIDs.sorted()) {
+            defaults.set(data, forKey: PreferenceKeys.removedStackPartIDs)
         }
     }
 

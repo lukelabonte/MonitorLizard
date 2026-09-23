@@ -87,7 +87,7 @@ struct PullRequest: Identifiable, Hashable, Codable {
     }
 
     /// True when something known prevents the PR from being merged: failing or
-    /// pending checks, a conflict, no recent activity, or changes requested.
+    /// pending checks, a conflict, no recent activity, or an outstanding review.
     /// Used both to surface PRs that need attention and to find what a stack waits on.
     var isMergeBlocked: Bool {
         mergeBlockReason != nil
@@ -96,8 +96,10 @@ struct PullRequest: Identifiable, Hashable, Codable {
     /// Short description of what prevents this PR from merging, or nil when nothing
     /// known blocks it.
     var mergeBlockReason: String? {
-        if reviewDecision == .changesRequested {
-            return "changes requested"
+        switch reviewDecision {
+        case .changesRequested: return "changes requested"
+        case .reviewRequired:   return "review required"
+        case .approved, nil:    break
         }
         switch buildStatus {
         case .failure:    return "failing checks"

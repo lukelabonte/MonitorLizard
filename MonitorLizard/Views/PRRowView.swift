@@ -555,8 +555,8 @@ private struct PRRowActions: View {
             Spacer(minLength: 0)
             VStack(spacing: 6) {
                 HStack(spacing: 8) {
-                    // Watch - fixed cell; hidden when no status checks
-                    if pr.hasStatusChecks {
+                    // Watch - fixed cell; unstacked PRs without checks stay hidden
+                    if pr.hasStatusChecks || pr.stack != nil {
                         Button(action: { viewModel.toggleWatch(for: pr) }) {
                             Image(systemName: pr.isWatched ? "eye.fill" : "eye")
                                 .font(.system(size: 13))

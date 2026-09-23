@@ -48,9 +48,6 @@ struct PRStackHeader: Hashable, Identifiable {
 
     let readiness: PRStackReadiness
 
-    /// True when any visible part has status checks, so the stack can be watched.
-    let hasStatusChecks: Bool
-
     var id: String { "stack-\(stackID)" }
 
     /// The part to work on next, when its position can be named unambiguously:
@@ -76,7 +73,12 @@ struct PRStackHeader: Hashable, Identifiable {
         case .blocked(let blocker):
             state = "Blocked by part \(blocker.position) (#\(blocker.number)) — \(blocker.reason)"
         case .unknown:
-            state = "\(visibleParts.count) of \(size) parts in your lists"
+            let visibleCount = "\(visibleParts.count) of \(size) parts in your lists"
+            if let blocker = readiness.blockingPart {
+                state = "\(visibleCount) · Visible part \(blocker.position) (#\(blocker.number)) blocked — \(blocker.reason)"
+            } else {
+                state = visibleCount
+            }
         }
         guard let landedText = readiness.landedText else { return state }
         return "\(landedText) · \(state)"
@@ -116,8 +118,9 @@ struct ReadyStack: Hashable {
 }
 
 /// What the app can say about a stack's readiness to merge, based on the parts it
-/// can see. A stack can only advance from its lowest part, so `status` follows the
-/// lowest part and stays ready even when parts above it are not. `blockingPart`
+/// can see. A stack can only advance from its lowest unmerged part, so `status`
+/// follows that part when every lower position is known merged, and stays ready
+/// even when parts above it are not. `blockingPart`
 /// names the lowest blocked visible part — the one everything above it is waiting
 /// on — whenever one is visible. Drafts count as blocked: a draft cannot merge
 /// even when its checks are green, so a draft member blocks with reason "draft".
@@ -181,8 +184,8 @@ struct PRStackReadiness: Hashable {
         return "Parts \(positions.map(String.init).joined(separator: ", ")) merged"
     }
 
-    /// One-line explanation for tooltips, or nil when the stack's state cannot be
-    /// judged.
+    /// One-line explanation for tooltips, or nil when neither readiness nor a
+    /// visible blocker can be identified.
     var helpText: String? {
         var state: String
         switch status {
@@ -202,7 +205,8 @@ struct PRStackReadiness: Hashable {
         case .blocked(let blocker):
             state = "Waiting on part \(blocker.position) of \(size) (\(blocker.reason))."
         case .unknown:
-            return nil
+            guard let blockingPart else { return nil }
+            state = "Readiness unknown; visible part \(blockingPart.position) of \(size) (#\(blockingPart.number)) is blocked (\(blockingPart.reason))."
         }
         guard let landedText else { return state }
         return "\(landedText). \(state)"
@@ -280,8 +284,7 @@ enum PRStackOrdering {
                 number: stack.number,
                 size: stack.size,
                 visibleParts: visibleParts,
-                readiness: readiness,
-                hasStatusChecks: members.contains { $0.hasStatusChecks }
+                readiness: readiness
             )))
 
             guard !collapsedStackIDs.contains(stack.id) else { continue }
@@ -309,10 +312,10 @@ enum PRStackOrdering {
     }
 
     /// Readiness of a stack from the parts the app can see. A stack advances from
-    /// its lowest part, so the lowest visible member decides whether merging can
-    /// start; a blocked part above it only names what comes next, through
-    /// `blockingPart`. A draft member counts as blocked with reason "draft": a
-    /// draft cannot merge even when its checks are green.
+    /// its lowest unmerged part. The lowest visible member decides whether merging
+    /// can start only when every position below it is known merged; a blocked part
+    /// above it only names what comes next, through `blockingPart`. A draft member
+    /// counts as blocked with reason "draft" even when its checks are green.
     static func readiness(of members: [PullRequest], stackSize: Int) -> PRStackReadiness {
         func isBlocked(_ member: PullRequest) -> Bool {
             member.isMergeBlocked || member.isDraft
@@ -339,21 +342,20 @@ enum PRStackOrdering {
             )
         }
 
-        // Only the lowest visible member can hold the stack back; a blocked part
-        // above it does not stop the lowest part from merging.
-        if let lowest = ordered.first, isBlocked(lowest), let blockingPart {
+        guard let lowest = ordered.first,
+              Set(1..<(lowest.stack?.position ?? 1)).isSubset(of: landed) else {
             return PRStackReadiness(
-                status: .blocked(blockingPart),
+                status: .unknown,
                 size: stackSize,
                 landedPositions: landed,
                 blockingPart: blockingPart
             )
         }
 
-        let hasBase = landed.contains(1) || ordered.contains { $0.stack?.position == 1 }
-        guard hasBase else {
+        // Only the part at the known merge frontier can hold the stack back.
+        if isBlocked(lowest), let blockingPart {
             return PRStackReadiness(
-                status: .unknown,
+                status: .blocked(blockingPart),
                 size: stackSize,
                 landedPositions: landed,
                 blockingPart: blockingPart

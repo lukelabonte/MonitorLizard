@@ -89,18 +89,16 @@ struct StackHeaderView: View {
             .accessibilityHint(isCollapsed ? "Expands the stack" : "Collapses the stack")
 
             // Watch - applies to every known part of the stack
-            if header.hasStatusChecks {
-                Button(action: { viewModel.toggleWatchForStack(header.stackID) }) {
-                    Image(systemName: isWatched ? "eye.fill" : "eye")
-                        .font(.system(size: 13))
-                        .foregroundColor(isWatched ? .blue : .gray)
-                }
-                .buttonStyle(.plain)
-                .help(watchHelpText)
-                .opacity(isHovering || isWatched ? 1.0 : 0.0)
-                .frame(width: 16, height: 16)
-                .accessibilityLabel(isWatched ? "Stop watching this stack" : "Watch this stack")
+            Button(action: { viewModel.toggleWatchForStack(header.stackID) }) {
+                Image(systemName: isWatched ? "eye.fill" : "eye")
+                    .font(.system(size: 13))
+                    .foregroundColor(isWatched ? .blue : .gray)
             }
+            .buttonStyle(.plain)
+            .help(watchHelpText)
+            .opacity(isHovering || isWatched ? 1.0 : 0.0)
+            .frame(width: 16, height: 16)
+            .accessibilityLabel(isWatched ? "Stop watching this stack" : "Watch this stack")
 
             // Open every known part, in merge order
             Button(action: openAllPRs) {
