@@ -1254,10 +1254,7 @@ struct StackWatchNotificationTests {
         }
         vm.stopPolling()
         // Let the poll started by init finish so only the refreshes below drive the spy.
-        for _ in 0..<40 {
-            if vm.lastRefreshTime != nil { break }
-            try? await Task.sleep(for: .milliseconds(25))
-        }
+        await waitForInitialRefresh(vm)
 
         stub.result = PRFetchResult(pullRequests: [
             makeStackedPR(1, position: 1, status: .pending),
@@ -1312,10 +1309,7 @@ struct StackWatchNotificationTests {
         }
         vm.stopPolling()
         // Let the poll started by init finish so only the refreshes below drive the spy.
-        for _ in 0..<40 {
-            if vm.lastRefreshTime != nil { break }
-            try? await Task.sleep(for: .milliseconds(25))
-        }
+        await waitForInitialRefresh(vm)
 
         // Part 1 has already merged, so part 2 of 3 is the one to merge next.
         stub.result = PRFetchResult(pullRequests: [
@@ -1514,10 +1508,7 @@ struct StackWatchNotificationTests {
         }
         firstVM.stopPolling()
         // Let the poll started by init finish so only the refreshes below drive the spy.
-        for _ in 0..<40 {
-            if firstVM.lastRefreshTime != nil { break }
-            try? await Task.sleep(for: .milliseconds(25))
-        }
+        await waitForInitialRefresh(firstVM)
 
         stub.result = PRFetchResult(pullRequests: [
             makeStackedPR(1, position: 1, status: .success),
@@ -1550,10 +1541,7 @@ struct StackWatchNotificationTests {
         }
         secondVM.stopPolling()
         // Wait for the initial refresh the relaunched VM schedules itself.
-        for _ in 0..<40 {
-            if secondVM.lastRefreshTime != nil { break }
-            try? await Task.sleep(for: .milliseconds(25))
-        }
+        await waitForInitialRefresh(secondVM)
 
         #expect(secondSpy.notifications.isEmpty, "An already-ready watched stack must not notify again after relaunch")
     }
@@ -1575,10 +1563,7 @@ struct StackWatchNotificationTests {
         }
         vm.stopPolling()
         // Let the poll started by init finish so only the refreshes below drive the spy.
-        for _ in 0..<40 {
-            if vm.lastRefreshTime != nil { break }
-            try? await Task.sleep(for: .milliseconds(25))
-        }
+        await waitForInitialRefresh(vm)
 
         stub.result = PRFetchResult(pullRequests: [
             makeStackedPR(1, position: 1, status: .success),

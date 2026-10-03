@@ -61,9 +61,7 @@ struct PRStackHeader: Hashable, Identifiable {
         let state: String
         switch readiness.status {
         case .allReady:
-            state = readiness.landedPositions.isEmpty
-                ? "All \(size) parts are ready to merge"
-                : "All remaining parts are ready to merge"
+            state = readiness.allReadyText
         case .readyToAdvance:
             if let startPart {
                 state = "Ready to merge — start with #\(startPart.number)"
@@ -184,15 +182,21 @@ struct PRStackReadiness: Hashable {
         return "Parts \(positions.map(String.init).joined(separator: ", ")) merged"
     }
 
+    /// The all-ready state phrase shared by `PRStackHeader.summary` and
+    /// `helpText`, without end punctuation; each caller appends its own.
+    var allReadyText: String {
+        landedPositions.isEmpty
+            ? "All \(size) parts are ready to merge"
+            : "All remaining parts are ready to merge"
+    }
+
     /// One-line explanation for tooltips, or nil when neither readiness nor a
     /// visible blocker can be identified.
     var helpText: String? {
         var state: String
         switch status {
         case .allReady:
-            state = landedPositions.isEmpty
-                ? "All \(size) parts are ready to merge."
-                : "All remaining parts are ready to merge."
+            state = "\(allReadyText)."
         case .readyToAdvance:
             state = landedPositions.isEmpty
                 ? "Part 1 is ready to merge."

@@ -126,11 +126,6 @@ class GitHubService: GitHubServicing, ObservableObject {
 
     // MARK: - Batch GraphQL
 
-    /// Placeholder for the stack selection inside the query templates. It is
-    /// replaced with `stackEntrySelection` when the host supports stacks, and with
-    /// an empty string for hosts whose schema predates stack support.
-    nonisolated private static let stackEntryPlaceholder = "__ML_STACK_ENTRY__"
-
     nonisolated private static let stackEntrySelection = """
     stackEntry {
       position
@@ -208,10 +203,10 @@ class GitHubService: GitHubServicing, ObservableObject {
                     }
                   }
                 }
-                \(stackEntryPlaceholder)
+                \(stackEntry)
               }
             }
-            """.replacingOccurrences(of: stackEntryPlaceholder, with: stackEntry)
+            """
         }
 
         return "query {\n\(fragments.joined(separator: "\n"))\nviewer { login }\n}"
@@ -236,10 +231,10 @@ class GitHubService: GitHubServicing, ObservableObject {
             pr\(index): repository(owner: "\(request.owner)", name: "\(request.repo)") {
               pullRequest(number: \(request.number)) {
             \(prDetailSelection(for: request))
-                \(stackEntryPlaceholder)
+                \(stackEntry)
               }
             }
-            """.replacingOccurrences(of: stackEntryPlaceholder, with: stackEntry)
+            """
         }
 
         return "query {\n\(fragments.joined(separator: "\n"))\nviewer { login }\n}"
